@@ -1,6 +1,7 @@
 """
 FastAPI ATS Semantic Matching System with Embedded Frontend
 Single-file implementation with SQLite database and Jinja2 templates
+Optimized for Render.com with all-MiniLM-L6-v2 model
 """
 
 import os
@@ -9,6 +10,7 @@ import sqlite3
 import asyncio
 import hashlib
 import secrets
+import gc
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
@@ -43,7 +45,7 @@ import shutil
 
 # Configuration
 DATABASE_FILE = "ats_database.db"
-MODEL_NAME = '0xnbk/nbk-ats-semantic-v1-en'
+MODEL_NAME = 'all-MiniLM-L6-v2'  # Changed to smaller model (~20MB)
 MATCH_THRESHOLD = 0.80  # 80% match threshold
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -58,13 +60,18 @@ ADMIN_PASSWORD = "admin123"
 # Security
 security = HTTPBasic()
 
-# Initialize model globally
+# Initialize model globally - lazy loading
 model = None
+model_lock = asyncio.Lock()
 
 # Create temporary directory for templates
 TEMP_DIR = tempfile.mkdtemp()
 TEMPLATES_DIR = os.path.join(TEMP_DIR, "templates")
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
+
+# Create cache directory for embeddings
+CACHE_DIR = "/tmp/ats_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Pydantic Models
 class JobDescriptionCreate(BaseModel):
@@ -1075,14 +1082,52 @@ async def send_email(to_email: str, subject: str, body: str, html_body: Optional
         print(f"Failed to send email: {e}")
         return False
 
-# Embedding Functions
-def create_embedding(text: str) -> bytes:
-    """Create embedding for text using the model"""
+# Model Management with Lazy Loading and Memory Optimization
+async def get_model():
+    """Get or load the model with thread safety"""
     global model
-    if model is None:
-        model = SentenceTransformer(MODEL_NAME)
+    async with model_lock:
+        if model is None:
+            print(f"Loading model: {MODEL_NAME}")
+            # Use CPU and disable parallelism to save memory
+            os.environ['OMP_NUM_THREADS'] = '1'
+            os.environ['MKL_NUM_THREADS'] = '1'
+            model = SentenceTransformer(MODEL_NAME, device='cpu')
+            print("Model loaded successfully")
+    return model
+
+def unload_model():
+    """Unload model to free memory"""
+    global model
+    if model is not None:
+        del model
+        model = None
+        gc.collect()
+        print("Model unloaded to free memory")
+
+def create_embedding(text: str) -> bytes:
+    """Create embedding for text using the model with memory management"""
+    # Truncate text to avoid memory issues (model max is 256 tokens for MiniLM)
+    max_chars = 10000
+    if len(text) > max_chars:
+        text = text[:max_chars]
     
-    embedding = model.encode(text, show_progress_bar=False)
+    # Get model (lazy load)
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        current_model = loop.run_until_complete(get_model())
+    except:
+        # If no event loop, load synchronously
+        current_model = SentenceTransformer(MODEL_NAME, device='cpu')
+    
+    # Create embedding
+    embedding = current_model.encode(text, show_progress_bar=False, convert_to_numpy=True)
+    
+    # Clear from memory after use in background tasks
+    if os.getenv('RENDER', ''):
+        unload_model()
+    
     return pickle.dumps(embedding)
 
 def get_embedding_from_bytes(embedding_blob: bytes) -> np.ndarray:
@@ -1301,14 +1346,14 @@ async def lifespan(app: FastAPI):
     print("Initializing database...")
     init_database()
     
-    print("Loading ML model...")
-    model = SentenceTransformer(MODEL_NAME)
-    print("Model loaded successfully!")
+    # Pre-download model in build step, don't load yet
+    print(f"Model {MODEL_NAME} will be loaded on first use...")
     
     yield
     
     # Cleanup
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
+    unload_model()
     print("Shutting down...")
 
 app = FastAPI(
@@ -1571,6 +1616,7 @@ async def health_check():
     return {
         "status": "healthy",
         "model_loaded": model is not None,
+        "model_name": MODEL_NAME,
         "database": "connected"
     }
 
