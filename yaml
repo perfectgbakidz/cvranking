@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: ats-api
+    runtime: python
+    pythonVersion: 3.11  # or 3.12
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn ats_api:app --host 0.0.0.0 --port $PORT
