@@ -6,7 +6,6 @@ Optimized for Render.com with all-MiniLM-L6-v2 model
 
 import os
 import re
-import sqlite3
 import asyncio
 import hashlib
 import secrets
@@ -17,12 +16,11 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import uvicorn
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, status, BackgroundTasks, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, status, BackgroundTasks, Request, Cookie
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 import aiohttp
 from email.mime.text import MIMEText
@@ -43,9 +41,12 @@ import pickle
 import tempfile
 import shutil
 
+# Async SQLite
+import aiosqlite
+
 # Configuration
 DATABASE_FILE = "ats_database.db"
-MODEL_NAME = 'all-MiniLM-L6-v2'  # Changed to smaller model (~20MB)
+MODEL_NAME = 'all-MiniLM-L6-v2'  # Smaller model (~20MB)
 MATCH_THRESHOLD = 0.80  # 80% match threshold
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -58,7 +59,7 @@ ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin123"
 
 # Security
-security = HTTPBasic()
+security = HTTPBasic(auto_error=False)  # Don't auto-error to handle via form
 
 # Initialize model globally - lazy loading
 model = None
@@ -532,7 +533,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
         <div class="nav-links">
             <a href="/admin/dashboard">Dashboard</a>
             <a href="#" onclick="openModal()">+ New Job</a>
-            <a href="/">Logout</a>
+            <a href="/admin/logout">Logout</a>
         </div>
     </div>
     
@@ -672,8 +673,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
                 const response = await fetch('/admin/jobs', {
                     method: 'POST',
                     headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': 'Basic ' + btoa('admin:admin123')
+                        'Content-Type': 'application/json'
                     },
                     body: JSON.stringify(data)
                 });
@@ -681,6 +681,9 @@ ADMIN_DASHBOARD_TEMPLATE = """
                 if (response.ok) {
                     alert('Job created successfully! Embedding generated.');
                     location.reload();
+                } else if (response.status === 401) {
+                    alert('Session expired. Please login again.');
+                    window.location.href = '/admin/login';
                 } else {
                     alert('Error creating job');
                 }
@@ -694,14 +697,14 @@ ADMIN_DASHBOARD_TEMPLATE = """
             
             try {
                 const response = await fetch(`/admin/jobs/${id}`, {
-                    method: 'DELETE',
-                    headers: {
-                        'Authorization': 'Basic ' + btoa('admin:admin123')
-                    }
+                    method: 'DELETE'
                 });
                 
                 if (response.ok) {
                     location.reload();
+                } else if (response.status === 401) {
+                    alert('Session expired. Please login again.');
+                    window.location.href = '/admin/login';
                 } else {
                     alert('Error deleting job');
                 }
@@ -967,74 +970,48 @@ def setup_templates():
     
     return TEMPLATES_DIR
 
-# Database setup
-def init_database():
+# Database setup - ASYNC VERSION
+async def init_database():
     """Initialize SQLite database with required tables"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    # Job descriptions table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS job_descriptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            description TEXT NOT NULL,
-            department TEXT,
-            location TEXT,
-            embedding BLOB,
-            embedding_created BOOLEAN DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Resumes table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS resumes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            full_name TEXT NOT NULL,
-            email TEXT NOT NULL,
-            resume_text TEXT NOT NULL,
-            embedding BLOB,
-            status TEXT DEFAULT 'pending',
-            matched_job_id INTEGER,
-            match_score REAL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (matched_job_id) REFERENCES job_descriptions(id)
-        )
-    """)
-    
-    # Create index for faster queries
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_resumes_status ON resumes(status)
-    """)
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_resumes_email ON resumes(email)
-    """)
-    
-    conn.commit()
-    conn.close()
-
-def get_db():
-    """Database dependency"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-# Authentication
-def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    """Verify admin credentials"""
-    if credentials.username != ADMIN_USERNAME or credentials.password != ADMIN_PASSWORD:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return credentials.username
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS job_descriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                department TEXT,
+                location TEXT,
+                embedding BLOB,
+                embedding_created BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS resumes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                full_name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                resume_text TEXT NOT NULL,
+                embedding BLOB,
+                status TEXT DEFAULT 'pending',
+                matched_job_id INTEGER,
+                match_score REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (matched_job_id) REFERENCES job_descriptions(id)
+            )
+        """)
+        
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_resumes_status ON resumes(status)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_resumes_email ON resumes(email)
+        """)
+        
+        await db.commit()
 
 # PDF Processing
 def extract_text_from_pdf(pdf_file: bytes) -> str:
@@ -1112,21 +1089,19 @@ def create_embedding(text: str) -> bytes:
     if len(text) > max_chars:
         text = text[:max_chars]
     
-    # Get model (lazy load)
-    import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-        current_model = loop.run_until_complete(get_model())
-    except:
-        # If no event loop, load synchronously
-        current_model = SentenceTransformer(MODEL_NAME, device='cpu')
+    # Run model inference in a thread pool to not block
+    import concurrent.futures
     
-    # Create embedding
-    embedding = current_model.encode(text, show_progress_bar=False, convert_to_numpy=True)
+    def _encode():
+        m = SentenceTransformer(MODEL_NAME, device='cpu')
+        emb = m.encode(text, show_progress_bar=False, convert_to_numpy=True)
+        del m
+        gc.collect()
+        return emb
     
-    # Clear from memory after use in background tasks
-    if os.getenv('RENDER', ''):
-        unload_model()
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future = executor.submit(_encode)
+        embedding = future.result()
     
     return pickle.dumps(embedding)
 
@@ -1139,14 +1114,14 @@ def calculate_similarity(embedding1: np.ndarray, embedding2: np.ndarray) -> floa
     similarity = cosine_similarity([embedding1], [embedding2])[0][0]
     return float(similarity)
 
-# Matching Logic
-async def find_best_job_match(resume_embedding: np.ndarray, db: sqlite3.Connection) -> Optional[Dict]:
+# Matching Logic - ASYNC VERSION
+async def find_best_job_match(resume_embedding: np.ndarray, db) -> Optional[Dict]:
     """Find the best matching job for a resume"""
-    cursor = db.cursor()
-    cursor.execute(
+    
+    cursor = await db.execute(
         "SELECT id, title, description, embedding FROM job_descriptions WHERE embedding_created = 1"
     )
-    jobs = cursor.fetchall()
+    jobs = await cursor.fetchall()
     
     if not jobs:
         return None
@@ -1171,15 +1146,14 @@ async def find_best_job_match(resume_embedding: np.ndarray, db: sqlite3.Connecti
     return best_match if best_match and best_score >= MATCH_THRESHOLD else None
 
 async def process_resume_matching(resume_id: int, background_tasks: BackgroundTasks):
-    """Process resume matching and send notification"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    """Process resume matching and send notification - ASYNC VERSION"""
     
-    try:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        
         # Get resume details
-        cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,))
-        resume = cursor.fetchone()
+        cursor = await db.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,))
+        resume = await cursor.fetchone()
         
         if not resume or resume["status"] != "pending":
             return
@@ -1187,11 +1161,11 @@ async def process_resume_matching(resume_id: int, background_tasks: BackgroundTa
         resume_embedding = get_embedding_from_bytes(resume["embedding"])
         
         # Find best match
-        match = await find_best_job_match(resume_embedding, conn)
+        match = await find_best_job_match(resume_embedding, db)
         
         if match:
             # Update resume with match
-            cursor.execute("""
+            await db.execute("""
                 UPDATE resumes 
                 SET status = 'matched', 
                     matched_job_id = ?, 
@@ -1237,7 +1211,7 @@ ATS Recruitment Team
             
         else:
             # No match found
-            cursor.execute("""
+            await db.execute("""
                 UPDATE resumes 
                 SET status = 'notified_no_match',
                     updated_at = CURRENT_TIMESTAMP
@@ -1260,23 +1234,17 @@ ATS Recruitment Team
 """
             await send_email(resume["email"], subject, body)
         
-        conn.commit()
-        
-    except Exception as e:
-        print(f"Error processing resume {resume_id}: {e}")
-    finally:
-        conn.close()
+        await db.commit()
 
 async def reprocess_pending_resumes(new_job_id: int, background_tasks: BackgroundTasks):
-    """Reprocess pending resumes when new job is added"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    """Reprocess pending resumes when new job is added - ASYNC VERSION"""
     
-    try:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        
         # Get new job embedding
-        cursor.execute("SELECT embedding FROM job_descriptions WHERE id = ?", (new_job_id,))
-        job = cursor.fetchone()
+        cursor = await db.execute("SELECT embedding FROM job_descriptions WHERE id = ?", (new_job_id,))
+        job = await cursor.fetchone()
         
         if not job or not job["embedding"]:
             return
@@ -1284,8 +1252,8 @@ async def reprocess_pending_resumes(new_job_id: int, background_tasks: Backgroun
         job_embedding = get_embedding_from_bytes(job["embedding"])
         
         # Get all pending resumes
-        cursor.execute("SELECT * FROM resumes WHERE status = 'pending'")
-        pending_resumes = cursor.fetchall()
+        cursor = await db.execute("SELECT * FROM resumes WHERE status = 'pending'")
+        pending_resumes = await cursor.fetchall()
         
         for resume in pending_resumes:
             if resume["embedding"]:
@@ -1294,7 +1262,7 @@ async def reprocess_pending_resumes(new_job_id: int, background_tasks: Backgroun
                 
                 if score >= MATCH_THRESHOLD:
                     # Update and notify
-                    cursor.execute("""
+                    await db.execute("""
                         UPDATE resumes 
                         SET status = 'matched', 
                             matched_job_id = ?, 
@@ -1304,8 +1272,8 @@ async def reprocess_pending_resumes(new_job_id: int, background_tasks: Backgroun
                     """, (new_job_id, score, resume["id"]))
                     
                     # Get job details for email
-                    cursor.execute("SELECT title, description FROM job_descriptions WHERE id = ?", (new_job_id,))
-                    job_details = cursor.fetchone()
+                    cursor = await db.execute("SELECT title, description FROM job_descriptions WHERE id = ?", (new_job_id,))
+                    job_details = await cursor.fetchone()
                     
                     # Send notification
                     subject = f"New Job Match Found! - {job_details['title']}"
@@ -1326,12 +1294,15 @@ ATS Recruitment Team
 """
                     await send_email(resume["email"], subject, body)
         
-        conn.commit()
-        
-    except Exception as e:
-        print(f"Error reprocessing resumes: {e}")
-    finally:
-        conn.close()
+        await db.commit()
+
+# Session-based authentication instead of HTTP Basic Auth
+async def get_current_admin(request: Request):
+    """Check if admin is logged in via session cookie"""
+    admin_session = request.cookies.get("admin_session")
+    if admin_session != "authenticated":
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return "admin"
 
 # FastAPI Application
 @asynccontextmanager
@@ -1342,11 +1313,10 @@ async def lifespan(app: FastAPI):
     # Setup templates
     setup_templates()
     
-    # Startup
+    # Startup - async init
     print("Initializing database...")
-    init_database()
+    await init_database()
     
-    # Pre-download model in build step, don't load yet
     print(f"Model {MODEL_NAME} will be loaded on first use...")
     
     yield
@@ -1393,10 +1363,11 @@ async def admin_login_page(request: Request, error: Optional[str] = None):
 
 @app.post("/admin/login")
 async def admin_login(request: Request, username: str = Form(...), password: str = Form(...)):
-    """Process admin login"""
+    """Process admin login - set session cookie instead of HTTP Basic Auth"""
     if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
-        # Redirect to dashboard with basic auth header
+        # Set session cookie and redirect
         response = RedirectResponse(url="/admin/dashboard", status_code=302)
+        response.set_cookie(key="admin_session", value="authenticated", httponly=True, max_age=3600)
         return response
     else:
         return templates.TemplateResponse(
@@ -1404,41 +1375,50 @@ async def admin_login(request: Request, username: str = Form(...), password: str
             {"request": request, "error": "Invalid username or password"}
         )
 
+@app.get("/admin/logout")
+async def admin_logout():
+    """Logout admin"""
+    response = RedirectResponse(url="/", status_code=302)
+    response.delete_cookie(key="admin_session")
+    return response
+
 @app.get("/admin/dashboard", response_class=HTMLResponse)
-async def admin_dashboard(request: Request, admin: str = Depends(verify_admin), db: sqlite3.Connection = Depends(get_db)):
-    """Admin dashboard"""
-    cursor = db.cursor()
+async def admin_dashboard(request: Request, admin: str = Depends(get_current_admin)):
+    """Admin dashboard - uses session cookie auth instead of HTTP Basic"""
     
-    # Get stats
-    cursor.execute("SELECT COUNT(*) as count FROM job_descriptions")
-    total_jobs = cursor.fetchone()["count"]
-    
-    cursor.execute("SELECT COUNT(*) as count FROM resumes")
-    total_resumes = cursor.fetchone()["count"]
-    
-    cursor.execute("SELECT COUNT(*) as count FROM resumes WHERE status = 'matched'")
-    matched = cursor.fetchone()["count"]
-    
-    cursor.execute("SELECT COUNT(*) as count FROM resumes WHERE status = 'pending'")
-    pending = cursor.fetchone()["count"]
-    
-    # Get jobs
-    cursor.execute("""
-        SELECT id, title, description, department, location, created_at 
-        FROM job_descriptions 
-        ORDER BY created_at DESC
-    """)
-    jobs = cursor.fetchall()
-    
-    # Get resumes with job titles
-    cursor.execute("""
-        SELECT r.*, j.title as job_title 
-        FROM resumes r
-        LEFT JOIN job_descriptions j ON r.matched_job_id = j.id
-        ORDER BY r.created_at DESC
-        LIMIT 50
-    """)
-    resumes = cursor.fetchall()
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        
+        # Get stats
+        cursor = await db.execute("SELECT COUNT(*) as count FROM job_descriptions")
+        total_jobs = (await cursor.fetchone())["count"]
+        
+        cursor = await db.execute("SELECT COUNT(*) as count FROM resumes")
+        total_resumes = (await cursor.fetchone())["count"]
+        
+        cursor = await db.execute("SELECT COUNT(*) as count FROM resumes WHERE status = 'matched'")
+        matched = (await cursor.fetchone())["count"]
+        
+        cursor = await db.execute("SELECT COUNT(*) as count FROM resumes WHERE status = 'pending'")
+        pending = (await cursor.fetchone())["count"]
+        
+        # Get jobs
+        cursor = await db.execute("""
+            SELECT id, title, description, department, location, created_at 
+            FROM job_descriptions 
+            ORDER BY created_at DESC
+        """)
+        jobs = await cursor.fetchall()
+        
+        # Get resumes with job titles
+        cursor = await db.execute("""
+            SELECT r.*, j.title as job_title 
+            FROM resumes r
+            LEFT JOIN job_descriptions j ON r.matched_job_id = j.id
+            ORDER BY r.created_at DESC
+            LIMIT 50
+        """)
+        resumes = await cursor.fetchall()
     
     return templates.TemplateResponse("admin_dashboard.html", {
         "request": request,
@@ -1452,31 +1432,27 @@ async def admin_dashboard(request: Request, admin: str = Depends(verify_admin), 
         "resumes": resumes
     })
 
-# API Endpoints
+# API Endpoints - ASYNC VERSIONS with session auth
 @app.post("/admin/jobs", response_model=JobDescriptionResponse)
 async def create_job_description(
     job: JobDescriptionCreate,
     background_tasks: BackgroundTasks,
-    admin: str = Depends(verify_admin),
-    db: sqlite3.Connection = Depends(get_db)
+    admin: str = Depends(get_current_admin)
 ):
-    """
-    Admin endpoint to upload job description.
-    Automatically creates embedding and reprocesses pending resumes.
-    """
-    cursor = db.cursor()
+    """Create job description - async version with session auth"""
     
     # Create embedding immediately
     embedding = create_embedding(job.description)
     
-    # Insert job
-    cursor.execute("""
-        INSERT INTO job_descriptions (title, description, department, location, embedding, embedding_created)
-        VALUES (?, ?, ?, ?, ?, 1)
-    """, (job.title, job.description, job.department, job.location, embedding))
-    
-    db.commit()
-    job_id = cursor.lastrowid
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        await db.execute("""
+            INSERT INTO job_descriptions (title, description, department, location, embedding, embedding_created)
+            VALUES (?, ?, ?, ?, ?, 1)
+        """, (job.title, job.description, job.department, job.location, embedding))
+        await db.commit()
+        
+        cursor = await db.execute("SELECT last_insert_rowid()")
+        job_id = (await cursor.fetchone())[0]
     
     # Reprocess pending resumes in background
     background_tasks.add_task(reprocess_pending_resumes, job_id, background_tasks)
@@ -1492,18 +1468,17 @@ async def create_job_description(
     }
 
 @app.get("/admin/jobs", response_model=List[JobDescriptionResponse])
-async def list_jobs(
-    admin: str = Depends(verify_admin),
-    db: sqlite3.Connection = Depends(get_db)
-):
-    """List all job descriptions"""
-    cursor = db.cursor()
-    cursor.execute("""
-        SELECT id, title, description, department, location, embedding_created, created_at 
-        FROM job_descriptions 
-        ORDER BY created_at DESC
-    """)
-    jobs = cursor.fetchall()
+async def list_jobs(admin: str = Depends(get_current_admin)):
+    """List all job descriptions - async version with session auth"""
+    
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT id, title, description, department, location, embedding_created, created_at 
+            FROM job_descriptions 
+            ORDER BY created_at DESC
+        """)
+        jobs = await cursor.fetchall()
     
     return [
         {
@@ -1519,35 +1494,31 @@ async def list_jobs(
     ]
 
 @app.delete("/admin/jobs/{job_id}")
-async def delete_job(
-    job_id: int,
-    admin: str = Depends(verify_admin),
-    db: sqlite3.Connection = Depends(get_db)
-):
-    """Delete a job description"""
-    cursor = db.cursor()
-    cursor.execute("DELETE FROM job_descriptions WHERE id = ?", (job_id,))
+async def delete_job(job_id: int, admin: str = Depends(get_current_admin)):
+    """Delete a job description - async version with session auth"""
     
-    if cursor.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Job not found")
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cursor = await db.execute("DELETE FROM job_descriptions WHERE id = ?", (job_id,))
+        await db.commit()
+        
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Job not found")
     
-    db.commit()
     return {"message": "Job deleted successfully"}
 
 @app.get("/admin/resumes")
-async def list_resumes(
-    admin: str = Depends(verify_admin),
-    db: sqlite3.Connection = Depends(get_db)
-):
-    """List all resumes with their match status"""
-    cursor = db.cursor()
-    cursor.execute("""
-        SELECT r.*, j.title as job_title 
-        FROM resumes r
-        LEFT JOIN job_descriptions j ON r.matched_job_id = j.id
-        ORDER BY r.created_at DESC
-    """)
-    resumes = cursor.fetchall()
+async def list_resumes(admin: str = Depends(get_current_admin)):
+    """List all resumes - async version with session auth"""
+    
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT r.*, j.title as job_title 
+            FROM resumes r
+            LEFT JOIN job_descriptions j ON r.matched_job_id = j.id
+            ORDER BY r.created_at DESC
+        """)
+        resumes = await cursor.fetchall()
     
     return [
         {
@@ -1562,19 +1533,15 @@ async def list_resumes(
         for resume in resumes
     ]
 
-# Public Endpoints
 @app.post("/upload-resume", response_model=ResumeUploadResponse)
 async def upload_resume(
     background_tasks: BackgroundTasks,
     full_name: str = Form(...),
     email: EmailStr = Form(...),
-    resume_file: UploadFile = File(...),
-    db: sqlite3.Connection = Depends(get_db)
+    resume_file: UploadFile = File(...)
 ):
-    """
-    Upload resume in PDF format with full name and email.
-    Automatically matches against existing jobs and sends notification.
-    """
+    """Upload resume - async version"""
+    
     # Validate file type
     if not resume_file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted")
@@ -1589,15 +1556,15 @@ async def upload_resume(
     # Create embedding
     resume_embedding = create_embedding(resume_text)
     
-    # Save to database
-    cursor = db.cursor()
-    cursor.execute("""
-        INSERT INTO resumes (full_name, email, resume_text, embedding, status)
-        VALUES (?, ?, ?, ?, 'pending')
-    """, (full_name, email, resume_text, resume_embedding))
-    
-    db.commit()
-    resume_id = cursor.lastrowid
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        await db.execute("""
+            INSERT INTO resumes (full_name, email, resume_text, embedding, status)
+            VALUES (?, ?, ?, ?, 'pending')
+        """, (full_name, email, resume_text, resume_embedding))
+        await db.commit()
+        
+        cursor = await db.execute("SELECT last_insert_rowid()")
+        resume_id = (await cursor.fetchone())[0]
     
     # Process matching in background
     background_tasks.add_task(process_resume_matching, resume_id, background_tasks)
