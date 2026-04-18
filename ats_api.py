@@ -1,6 +1,6 @@
 """
 FastAPI ATS Semantic Matching System with Embedded Frontend
-Uses HuggingFace Inference API instead of local model to save memory
+Uses HuggingFace Inference API with specialized ATS model
 Optimized for Render.com free tier (512MB)
 """
 
@@ -10,7 +10,6 @@ import asyncio
 import hashlib
 import secrets
 import gc
-import base64
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
@@ -48,8 +47,9 @@ import shutil
 DATABASE_FILE = "ats_database.db"
 MATCH_THRESHOLD = 0.80  # 80% match threshold
 
-# HuggingFace API for embeddings (FREE, no model download needed)
-HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+# HuggingFace API for embeddings - USING SPECIALIZED ATS MODEL
+# Model: 0xnbk/nbk-ats-semantic-v1-en (specialized for resume-job matching)
+HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/0xnbk/nbk-ats-semantic-v1-en"
 HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")  # Optional: get token from huggingface.co/settings/tokens
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
@@ -99,7 +99,7 @@ class MatchResult(BaseModel):
     similarity_score: float
     job_title: str
 
-# HTML Templates (same as before)
+# HTML Templates
 INDEX_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -225,7 +225,7 @@ INDEX_TEMPLATE = """
                 </div>
                 <div class="feature-item">
                     <h3>🤖 AI Analysis</h3>
-                    <p>Semantic embedding generation</p>
+                    <p>Specialized ATS model (nbk-ats-semantic-v1-en)</p>
                 </div>
                 <div class="feature-item">
                     <h3>🎯 Matching</h3>
@@ -1054,9 +1054,9 @@ async def send_email(to_email: str, subject: str, body: str, html_body: Optional
         print(f"Failed to send email: {e}")
         return False
 
-# HuggingFace API Embedding - NO LOCAL MODEL NEEDED
+# HuggingFace API Embedding - USING SPECIALIZED ATS MODEL
 async def create_embedding_api(text: str) -> bytes:
-    """Create embedding using HuggingFace Inference API (FREE, no memory usage)"""
+    """Create embedding using HuggingFace Inference API with specialized ATS model"""
     # Truncate text to avoid API limits
     max_chars = 5000
     if len(text) > max_chars:
@@ -1066,7 +1066,7 @@ async def create_embedding_api(text: str) -> bytes:
     if HF_API_TOKEN:
         headers["Authorization"] = f"Bearer {HF_API_TOKEN}"
     
-    # Try API first, fallback to simple hash-based embedding if API fails
+    # Try specialized ATS model first
     try:
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1084,28 +1084,51 @@ async def create_embedding_api(text: str) -> bytes:
                             embedding = np.mean(result, axis=0)
                         else:
                             embedding = np.array(result)
+                        print(f"Successfully generated embedding using specialized ATS model, shape: {embedding.shape}")
                         return pickle.dumps(embedding)
                     else:
                         raise Exception("Invalid API response format")
                 else:
-                    # API error, use fallback
-                    raise Exception(f"API error: {response.status}")
+                    error_text = await response.text()
+                    raise Exception(f"API error: {response.status} - {error_text}")
     except Exception as e:
-        print(f"HF API failed ({e}), using fallback embedding")
-        # Fallback: Create a simple TF-IDF like embedding from text hash
-        # This preserves some semantic similarity for demo purposes
-        words = set(text.lower().split())
-        # Create a simple vector based on word presence
-        embedding = np.zeros(384)  # Same size as MiniLM
-        for i, word in enumerate(list(words)[:384]):
-            # Use hash to create deterministic but distributed values
-            hash_val = int(hashlib.md5(word.encode()).hexdigest(), 16)
-            embedding[i] = (hash_val % 1000) / 1000.0
-        # Normalize
-        norm = np.linalg.norm(embedding)
-        if norm > 0:
-            embedding = embedding / norm
-        return pickle.dumps(embedding)
+        print(f"Specialized ATS model API failed ({e}), trying fallback...")
+        # Fallback to all-MiniLM-L6-v2 if specialized model fails
+        fallback_url = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    fallback_url,
+                    headers=headers,
+                    json={"inputs": text}
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        if isinstance(result, list) and len(result) > 0:
+                            if isinstance(result[0], list):
+                                embedding = np.mean(result, axis=0)
+                            else:
+                                embedding = np.array(result)
+                            print(f"Successfully generated embedding using fallback model, shape: {embedding.shape}")
+                            return pickle.dumps(embedding)
+                        else:
+                            raise Exception("Invalid fallback API response format")
+                    else:
+                        raise Exception(f"Fallback API error: {response.status}")
+        except Exception as e2:
+            print(f"Fallback API also failed ({e2}), using hash-based embedding")
+            # Final fallback: Create a simple deterministic embedding from text hash
+            words = set(text.lower().split())
+            embedding = np.zeros(384)  # Same size as MiniLM
+            for i, word in enumerate(list(words)[:384]):
+                hash_val = int(hashlib.md5(word.encode()).hexdigest(), 16)
+                embedding[i] = (hash_val % 1000) / 1000.0
+            norm = np.linalg.norm(embedding)
+            if norm > 0:
+                embedding = embedding / norm
+            print(f"Generated hash-based fallback embedding, shape: {embedding.shape}")
+            return pickle.dumps(embedding)
 
 def get_embedding_from_bytes(embedding_blob: bytes) -> np.ndarray:
     """Deserialize embedding from bytes"""
@@ -1318,7 +1341,8 @@ async def lifespan(app: FastAPI):
     print("Initializing database...")
     await init_database()
     
-    print("Using HuggingFace Inference API for embeddings (no local model)")
+    print(f"Using HuggingFace Inference API with specialized ATS model: 0xnbk/nbk-ats-semantic-v1-en")
+    print("Model runs on HF servers - zero memory usage on this instance")
     
     yield
     
@@ -1328,8 +1352,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ATS Semantic Matching API",
-    description="AI-powered Applicant Tracking System using HuggingFace API",
-    version="2.0.0",
+    description="AI-powered Applicant Tracking System using specialized ATS model via HuggingFace API",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -1438,9 +1462,9 @@ async def create_job_description(
     background_tasks: BackgroundTasks,
     admin: str = Depends(get_current_admin)
 ):
-    """Create job description - uses HF API for embeddings"""
+    """Create job description - uses HF API with specialized ATS model"""
     
-    # Create embedding via API
+    # Create embedding via API (specialized ATS model)
     embedding = await create_embedding_api(job.description)
     
     async with aiosqlite.connect(DATABASE_FILE) as db:
@@ -1539,7 +1563,7 @@ async def upload_resume(
     email: EmailStr = Form(...),
     resume_file: UploadFile = File(...)
 ):
-    """Upload resume - uses HF API for embeddings"""
+    """Upload resume - uses HF API with specialized ATS model"""
     
     # Validate file type
     if not resume_file.filename.endswith('.pdf'):
@@ -1552,7 +1576,7 @@ async def upload_resume(
     if not resume_text or len(resume_text) < 100:
         raise HTTPException(status_code=400, detail="Could not extract sufficient text from PDF")
     
-    # Create embedding via API
+    # Create embedding via API (specialized ATS model)
     resume_embedding = await create_embedding_api(resume_text)
     
     async with aiosqlite.connect(DATABASE_FILE) as db:
@@ -1581,7 +1605,9 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "embedding_source": "HuggingFace API (fallback: hash-based)",
+        "embedding_source": "HuggingFace Inference API",
+        "model": "0xnbk/nbk-ats-semantic-v1-en (specialized ATS model)",
+        "fallback": "all-MiniLM-L6-v2 or hash-based",
         "database": "connected",
         "memory_usage": "minimal (no local ML model)"
     }
