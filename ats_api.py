@@ -1,7 +1,6 @@
 """
-FastAPI ATS Semantic Matching System with Embedded Frontend
-Uses HuggingFace Inference API with specialized ATS model
-Optimized for Render.com free tier (512MB)
+FastAPI ATS Semantic Matching System with Multi-Role Authentication
+Roles: Recruiter (Admin), Employer, Graduate (Applicant)
 """
 
 import os
@@ -10,22 +9,26 @@ import asyncio
 import hashlib
 import secrets
 import gc
-from datetime import datetime
-from typing import List, Optional, Dict, Any
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any, Union
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from enum import Enum
 
 import uvicorn
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, status, BackgroundTasks, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, status, BackgroundTasks, Request, Cookie
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, validator
 import aiohttp
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import aiosmtplib
+
+# Password hashing
+from passlib.context import CryptContext
 
 # Document processing
 import PyPDF2
@@ -47,10 +50,9 @@ import shutil
 DATABASE_FILE = "ats_database.db"
 MATCH_THRESHOLD = 0.80  # 80% match threshold
 
-# HuggingFace API for embeddings - USING SPECIALIZED ATS MODEL
-# Model: 0xnbk/nbk-ats-semantic-v1-en (specialized for resume-job matching)
+# HuggingFace API for embeddings
 HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/0xnbk/nbk-ats-semantic-v1-en"
-HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")  # Optional: get token from huggingface.co/settings/tokens
+HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -58,24 +60,56 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 FROM_EMAIL = os.getenv("FROM_EMAIL", "noreply@ats-system.com")
 
-# Admin credentials (in production, use hashed passwords)
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "admin123"
-
 # Security
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBasic(auto_error=False)
+
+# Session management
+SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
+active_sessions: Dict[str, Dict[str, Any]] = {}
 
 # Create temporary directory for templates
 TEMP_DIR = tempfile.mkdtemp()
 TEMPLATES_DIR = os.path.join(TEMP_DIR, "templates")
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
 
-# Pydantic Models
+# ============== ENUMS ==============
+
+class UserRole(str, Enum):
+    RECRUITER = "recruiter"
+    EMPLOYER = "employer"
+    GRADUATE = "graduate"
+
+class ApplicationStatus(str, Enum):
+    PENDING = "pending"
+    MATCHED = "matched"
+    REVIEWING = "reviewing"
+    INTERVIEW = "interview"
+    HIRED = "hired"
+    REJECTED = "rejected"
+    NOTIFIED_NO_MATCH = "notified_no_match"
+
+# ============== PYDANTIC MODELS ==============
+
+class UserSignup(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+    full_name: str = Field(..., min_length=2)
+    role: UserRole
+    company_name: Optional[str] = None
+    phone: Optional[str] = None
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
 class JobDescriptionCreate(BaseModel):
     title: str
     description: str
     department: Optional[str] = None
     location: Optional[str] = None
+    requirements: Optional[str] = None
+    salary_range: Optional[str] = None
 
 class JobDescriptionResponse(BaseModel):
     id: int
@@ -83,6 +117,8 @@ class JobDescriptionResponse(BaseModel):
     description: str
     department: Optional[str]
     location: Optional[str]
+    employer_id: int
+    employer_name: str
     embedding_created: bool
     created_at: str
 
@@ -98,8 +134,16 @@ class MatchResult(BaseModel):
     job_id: int
     similarity_score: float
     job_title: str
+    employer_id: int
 
-# HTML Templates
+class EmployerStats(BaseModel):
+    total_jobs: int
+    total_applications: int
+    matched_candidates: int
+    pending_reviews: int
+
+# ============== HTML TEMPLATES ==============
+
 INDEX_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -129,7 +173,7 @@ INDEX_TEMPLATE = """
         .header p { font-size: 1.2em; opacity: 0.9; }
         .cards {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
             gap: 30px;
             margin-top: 40px;
         }
@@ -160,10 +204,16 @@ INDEX_TEMPLATE = """
             border: none;
             cursor: pointer;
             font-size: 1em;
+            margin: 5px;
         }
         .btn:hover {
             transform: scale(1.05);
             box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
+        }
+        .btn-secondary {
+            background: white;
+            color: #667eea;
+            border: 2px solid #667eea;
         }
         .features {
             margin-top: 60px;
@@ -191,6 +241,14 @@ INDEX_TEMPLATE = """
             margin-top: 60px;
             opacity: 0.8;
         }
+        .auth-links {
+            margin-top: 20px;
+        }
+        .auth-links a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
     </style>
 </head>
 <body>
@@ -202,17 +260,26 @@ INDEX_TEMPLATE = """
         
         <div class="cards">
             <div class="card">
-                <div class="card-icon">👨‍💼</div>
-                <h2>I'm a Candidate</h2>
+                <div class="card-icon">🎓</div>
+                <h2>I'm a Graduate</h2>
                 <p>Upload your resume and let our AI match you with the perfect job opportunities. Get instant notifications when matches are found.</p>
-                <a href="/submit-resume" class="btn">Upload Resume</a>
+                <a href="/signup?role=graduate" class="btn">Sign Up</a>
+                <a href="/login?role=graduate" class="btn btn-secondary">Login</a>
             </div>
             
             <div class="card">
                 <div class="card-icon">🏢</div>
-                <h2>I'm an Admin</h2>
-                <p>Post job descriptions, manage applications, and review AI-powered candidate matches with semantic analysis.</p>
-                <a href="/admin/login" class="btn">Admin Portal</a>
+                <h2>I'm an Employer</h2>
+                <p>Post job descriptions, review matched candidates, and manage your hiring pipeline with AI-powered semantic analysis.</p>
+                <a href="/signup?role=employer" class="btn">Sign Up</a>
+                <a href="/login?role=employer" class="btn btn-secondary">Login</a>
+            </div>
+            
+            <div class="card">
+                <div class="card-icon">👔</div>
+                <h2>I'm a Recruiter</h2>
+                <p>Manage the entire platform, oversee employers and applicants, and review all matching activities from the admin dashboard.</p>
+                <a href="/login?role=recruiter" class="btn">Recruiter Login</a>
             </div>
         </div>
         
@@ -221,11 +288,15 @@ INDEX_TEMPLATE = """
             <div class="feature-grid">
                 <div class="feature-item">
                     <h3>📝 Upload</h3>
-                    <p>Candidates upload PDF resumes</p>
+                    <p>Graduates upload PDF resumes</p>
+                </div>
+                <div class="feature-item">
+                    <h3>🏢 Post Jobs</h3>
+                    <p>Employers post opportunities</p>
                 </div>
                 <div class="feature-item">
                     <h3>🤖 AI Analysis</h3>
-                    <p>Specialized ATS model (nbk-ats-semantic-v1-en)</p>
+                    <p>Specialized ATS model matching</p>
                 </div>
                 <div class="feature-item">
                     <h3>🎯 Matching</h3>
@@ -234,6 +305,10 @@ INDEX_TEMPLATE = """
                 <div class="feature-item">
                     <h3>📧 Notification</h3>
                     <p>Automatic email alerts</p>
+                </div>
+                <div class="feature-item">
+                    <h3>📊 Dashboard</h3>
+                    <p>Track candidates & jobs</p>
                 </div>
             </div>
         </div>
@@ -246,13 +321,155 @@ INDEX_TEMPLATE = """
 </html>
 """
 
-ADMIN_LOGIN_TEMPLATE = """
+SIGNUP_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Login - ATS System</title>
+    <title>Sign Up - ATS System</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .signup-box {
+            background: white;
+            padding: 50px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            width: 100%;
+            max-width: 450px;
+        }
+        .signup-box h1 { color: #667eea; margin-bottom: 10px; text-align: center; }
+        .signup-box .role-badge {
+            text-align: center;
+            background: #f0f0f0;
+            padding: 8px 20px;
+            border-radius: 20px;
+            display: inline-block;
+            margin: 0 auto 20px;
+            font-weight: 600;
+            color: #667eea;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 600;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 1em;
+            transition: border-color 0.3s;
+        }
+        .form-group input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .btn {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: transform 0.3s;
+        }
+        .btn:hover { transform: scale(1.02); }
+        .back-link {
+            display: block;
+            text-align: center;
+            margin-top: 20px;
+            color: #667eea;
+            text-decoration: none;
+        }
+        .error {
+            color: #e74c3c;
+            margin-bottom: 20px;
+            padding: 10px;
+            background: #fee;
+            border-radius: 5px;
+            text-align: center;
+        }
+        .success {
+            color: #28a745;
+            margin-bottom: 20px;
+            padding: 10px;
+            background: #d4edda;
+            border-radius: 5px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="signup-box">
+        <h1>📝 Sign Up</h1>
+        <div style="text-align: center;">
+            <span class="role-badge">{{ role.title() }}</span>
+        </div>
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        {% if success %}
+        <div class="success">{{ success }}</div>
+        {% endif %}
+        <form action="/signup" method="post" id="signupForm">
+            <input type="hidden" name="role" value="{{ role }}">
+            <div class="form-group">
+                <label>Full Name</label>
+                <input type="text" name="full_name" required placeholder="John Doe">
+            </div>
+            <div class="form-group">
+                <label>Email Address</label>
+                <input type="email" name="email" required placeholder="john@example.com">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" name="password" required placeholder="Min 6 characters" minlength="6">
+            </div>
+            {% if role == 'employer' %}
+            <div class="form-group">
+                <label>Company Name</label>
+                <input type="text" name="company_name" required placeholder="Acme Inc.">
+            </div>
+            {% endif %}
+            <div class="form-group">
+                <label>Phone (Optional)</label>
+                <input type="tel" name="phone" placeholder="+1 234 567 890">
+            </div>
+            <button type="submit" class="btn">Create Account</button>
+        </form>
+        <a href="/login?role={{ role }}" class="back-link">Already have an account? Login →</a>
+        <br>
+        <a href="/" class="back-link">← Back to Home</a>
+    </div>
+</body>
+</html>
+"""
+
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - ATS System</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -273,7 +490,15 @@ ADMIN_LOGIN_TEMPLATE = """
             text-align: center;
         }
         .login-box h1 { color: #667eea; margin-bottom: 10px; }
-        .login-box p { color: #666; margin-bottom: 30px; }
+        .login-box .role-badge {
+            background: #f0f0f0;
+            padding: 8px 20px;
+            border-radius: 20px;
+            display: inline-block;
+            margin-bottom: 30px;
+            font-weight: 600;
+            color: #667eea;
+        }
         .form-group {
             margin-bottom: 20px;
             text-align: left;
@@ -326,15 +551,16 @@ ADMIN_LOGIN_TEMPLATE = """
 </head>
 <body>
     <div class="login-box">
-        <h1>🔐 Admin Login</h1>
-        <p>Enter your credentials to access the dashboard</p>
+        <h1>🔐 Login</h1>
+        <span class="role-badge">{{ role.title() }}</span>
         {% if error %}
         <div class="error">{{ error }}</div>
         {% endif %}
-        <form action="/admin/login" method="post">
+        <form action="/login" method="post">
+            <input type="hidden" name="role" value="{{ role }}">
             <div class="form-group">
-                <label>Username</label>
-                <input type="text" name="username" required placeholder="admin">
+                <label>Email</label>
+                <input type="email" name="email" required placeholder="john@example.com">
             </div>
             <div class="form-group">
                 <label>Password</label>
@@ -342,19 +568,21 @@ ADMIN_LOGIN_TEMPLATE = """
             </div>
             <button type="submit" class="btn">Sign In</button>
         </form>
+        <a href="/signup?role={{ role }}" class="back-link">Don't have an account? Sign up →</a>
+        <br>
         <a href="/" class="back-link">← Back to Home</a>
     </div>
 </body>
 </html>
 """
 
-ADMIN_DASHBOARD_TEMPLATE = """
+EMPLOYER_DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Dashboard - ATS System</title>
+    <title>Employer Dashboard - ATS System</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -383,26 +611,31 @@ ADMIN_DASHBOARD_TEMPLATE = """
             margin: 0 auto;
             padding: 40px;
         }
+        .welcome {
+            margin-bottom: 30px;
+        }
+        .welcome h2 { color: #333; margin-bottom: 5px; }
+        .welcome p { color: #666; }
         .stats {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 20px;
             margin-bottom: 40px;
         }
         .stat-card {
             background: white;
-            padding: 30px;
+            padding: 25px;
             border-radius: 15px;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.08);
         }
         .stat-card h3 {
             color: #666;
-            font-size: 0.9em;
+            font-size: 0.85em;
             text-transform: uppercase;
             margin-bottom: 10px;
         }
         .stat-card .number {
-            font-size: 2.5em;
+            font-size: 2.2em;
             color: #667eea;
             font-weight: bold;
         }
@@ -411,7 +644,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
             border-radius: 15px;
             padding: 30px;
             margin-bottom: 30px;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.08);
         }
         .section h2 {
             color: #333;
@@ -431,13 +664,9 @@ ADMIN_DASHBOARD_TEMPLATE = """
             text-decoration: none;
             display: inline-block;
         }
-        .btn-danger {
-            background: #e74c3c;
-        }
-        .btn-sm {
-            padding: 5px 15px;
-            font-size: 0.8em;
-        }
+        .btn-success { background: #28a745; }
+        .btn-info { background: #17a2b8; }
+        .btn-sm { padding: 5px 15px; font-size: 0.8em; }
         table {
             width: 100%;
             border-collapse: collapse;
@@ -462,7 +691,8 @@ ADMIN_DASHBOARD_TEMPLATE = """
         }
         .badge-matched { background: #d4edda; color: #155724; }
         .badge-pending { background: #fff3cd; color: #856404; }
-        .badge-notified { background: #d1ecf1; color: #0c5460; }
+        .badge-reviewing { background: #cce5ff; color: #004085; }
+        .badge-interview { background: #e2d4f0; color: #4a148c; }
         .progress-bar {
             width: 100%;
             height: 8px;
@@ -474,6 +704,19 @@ ADMIN_DASHBOARD_TEMPLATE = """
             height: 100%;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             transition: width 0.3s;
+        }
+        .candidate-card {
+            border: 1px solid #eee;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 15px;
+        }
+        .candidate-card h4 { color: #333; margin-bottom: 5px; }
+        .candidate-card p { color: #666; font-size: 0.9em; margin-bottom: 10px; }
+        .candidate-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 10px;
         }
         .modal {
             display: none;
@@ -490,7 +733,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
             padding: 40px;
             border-radius: 20px;
             width: 90%;
-            max-width: 600px;
+            max-width: 700px;
             max-height: 90vh;
             overflow-y: auto;
         }
@@ -512,7 +755,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
             font-family: inherit;
         }
         .form-group textarea {
-            min-height: 200px;
+            min-height: 150px;
             resize: vertical;
         }
         .close-btn {
@@ -521,43 +764,62 @@ ADMIN_DASHBOARD_TEMPLATE = """
             cursor: pointer;
             color: #666;
         }
+        .notification {
+            background: #d4edda;
+            border-left: 4px solid #28a745;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            display: none;
+        }
+        .notification.show { display: block; }
     </style>
 </head>
 <body>
     <div class="navbar">
-        <h1>🎯 Smart ATS Admin</h1>
+        <h1>🏢 Employer Portal</h1>
         <div class="nav-links">
-            <a href="/admin/dashboard">Dashboard</a>
-            <a href="#" onclick="openModal()">+ New Job</a>
-            <a href="/admin/logout">Logout</a>
+            <a href="/employer/dashboard">Dashboard</a>
+            <a href="#" onclick="openModal()">+ Post Job</a>
+            <a href="/logout">Logout</a>
         </div>
     </div>
     
     <div class="container">
+        <div class="welcome">
+            <h2>Welcome, {{ user.full_name }}</h2>
+            <p>{{ user.company_name or 'Your Company' }}</p>
+        </div>
+        
+        <div id="notification" class="notification">
+            <strong>🎉 New Match!</strong> A new candidate has matched one of your job postings.
+        </div>
+        
         <div class="stats">
             <div class="stat-card">
-                <h3>Total Jobs</h3>
+                <h3>Active Jobs</h3>
                 <div class="number">{{ stats.total_jobs }}</div>
             </div>
             <div class="stat-card">
-                <h3>Total Resumes</h3>
-                <div class="number">{{ stats.total_resumes }}</div>
+                <h3>Total Applications</h3>
+                <div class="number">{{ stats.total_applications }}</div>
             </div>
             <div class="stat-card">
-                <h3>Matched</h3>
-                <div class="number">{{ stats.matched }}</div>
+                <h3>Matched Candidates</h3>
+                <div class="number">{{ stats.matched_candidates }}</div>
             </div>
             <div class="stat-card">
-                <h3>Pending</h3>
-                <div class="number">{{ stats.pending }}</div>
+                <h3>Pending Review</h3>
+                <div class="number">{{ stats.pending_reviews }}</div>
             </div>
         </div>
         
         <div class="section">
             <h2>
-                Job Descriptions
-                <button class="btn" onclick="openModal()">+ Add New Job</button>
+                My Job Postings
+                <button class="btn" onclick="openModal()">+ Post New Job</button>
             </h2>
+            {% if jobs %}
             <table>
                 <thead>
                     <tr>
@@ -565,6 +827,7 @@ ADMIN_DASHBOARD_TEMPLATE = """
                         <th>Department</th>
                         <th>Location</th>
                         <th>Posted</th>
+                        <th>Matches</th>
                         <th>Actions</th>
                     </tr>
                 </thead>
@@ -575,64 +838,47 @@ ADMIN_DASHBOARD_TEMPLATE = """
                         <td>{{ job.department or 'N/A' }}</td>
                         <td>{{ job.location or 'N/A' }}</td>
                         <td>{{ job.created_at }}</td>
+                        <td><span class="badge badge-matched">{{ job.match_count }}</span></td>
                         <td>
+                            <a href="/employer/jobs/{{ job.id }}/candidates" class="btn btn-info btn-sm">View Candidates</a>
                             <button class="btn btn-danger btn-sm" onclick="deleteJob({{ job.id }})">Delete</button>
                         </td>
                     </tr>
                     {% endfor %}
                 </tbody>
             </table>
+            {% else %}
+            <p style="text-align: center; color: #666; padding: 40px;">No jobs posted yet. Click "Post New Job" to get started!</p>
+            {% endif %}
         </div>
         
         <div class="section">
-            <h2>Recent Applications</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Candidate</th>
-                        <th>Email</th>
-                        <th>Status</th>
-                        <th>Match Score</th>
-                        <th>Matched Job</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for resume in resumes %}
-                    <tr>
-                        <td><strong>{{ resume.full_name }}</strong></td>
-                        <td>{{ resume.email }}</td>
-                        <td>
-                            <span class="badge badge-{{ resume.status }}">
-                                {{ resume.status }}
-                            </span>
-                        </td>
-                        <td>
-                            {% if resume.match_score %}
-                            <div style="display: flex; align-items: center; gap: 10px;">
-                                <span>{{ "%.1f"|format(resume.match_score * 100) }}%</span>
-                                <div class="progress-bar" style="width: 100px;">
-                                    <div class="progress-fill" style="width: {{ resume.match_score * 100 }}%"></div>
-                                </div>
-                            </div>
-                            {% else %}
-                            -
-                            {% endif %}
-                        </td>
-                        <td>{{ resume.job_title or '-' }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+            <h2>Recent Matched Candidates</h2>
+            {% if recent_matches %}
+                {% for match in recent_matches %}
+                <div class="candidate-card">
+                    <h4>{{ match.full_name }} — {{ match.job_title }}</h4>
+                    <p>📧 {{ match.email }} | 🎯 Match Score: {{ "%.1f"|format(match.match_score * 100) }}%</p>
+                    <div class="candidate-actions">
+                        <a href="/employer/candidates/{{ match.resume_id }}/cv" class="btn btn-info btn-sm" target="_blank">📄 View CV</a>
+                        <a href="mailto:{{ match.email }}" class="btn btn-success btn-sm">📧 Email Candidate</a>
+                        <button class="btn btn-sm" onclick="updateStatus({{ match.resume_id }}, 'interview')">📅 Schedule Interview</button>
+                    </div>
+                </div>
+                {% endfor %}
+            {% else %}
+            <p style="text-align: center; color: #666; padding: 40px;">No matched candidates yet. Post jobs to start receiving matches!</p>
+            {% endif %}
         </div>
     </div>
     
     <div id="jobModal" class="modal">
         <div class="modal-content">
             <span class="close-btn" onclick="closeModal()">&times;</span>
-            <h2>Create New Job Description</h2>
+            <h2>Post New Job</h2>
             <form id="jobForm" onsubmit="submitJob(event)">
                 <div class="form-group">
-                    <label>Job Title</label>
+                    <label>Job Title *</label>
                     <input type="text" name="title" required placeholder="e.g., Senior Python Developer">
                 </div>
                 <div class="form-group">
@@ -644,10 +890,18 @@ ADMIN_DASHBOARD_TEMPLATE = """
                     <input type="text" name="location" placeholder="e.g., Remote, New York, NY">
                 </div>
                 <div class="form-group">
-                    <label>Job Description</label>
+                    <label>Salary Range</label>
+                    <input type="text" name="salary_range" placeholder="e.g., $80k - $120k">
+                </div>
+                <div class="form-group">
+                    <label>Job Description *</label>
                     <textarea name="description" required placeholder="Enter detailed job description..."></textarea>
                 </div>
-                <button type="submit" class="btn" style="width: 100%;">Create Job & Generate Embedding</button>
+                <div class="form-group">
+                    <label>Requirements</label>
+                    <textarea name="requirements" placeholder="Enter job requirements, skills needed..."></textarea>
+                </div>
+                <button type="submit" class="btn" style="width: 100%;">Post Job & Generate Embedding</button>
             </form>
         </div>
     </div>
@@ -666,22 +920,21 @@ ADMIN_DASHBOARD_TEMPLATE = """
             const data = Object.fromEntries(formData);
             
             try {
-                const response = await fetch('/admin/jobs', {
+                const response = await fetch('/employer/jobs', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(data)
                 });
                 
                 if (response.ok) {
-                    alert('Job created successfully! Embedding generated.');
+                    alert('Job posted successfully!');
                     location.reload();
                 } else if (response.status === 401) {
                     alert('Session expired. Please login again.');
-                    window.location.href = '/admin/login';
+                    window.location.href = '/login?role=employer';
                 } else {
-                    alert('Error creating job');
+                    const err = await response.json();
+                    alert('Error: ' + (err.detail || 'Something went wrong'));
                 }
             } catch (err) {
                 alert('Error: ' + err.message);
@@ -689,29 +942,583 @@ ADMIN_DASHBOARD_TEMPLATE = """
         }
         
         async function deleteJob(id) {
-            if (!confirm('Are you sure you want to delete this job?')) return;
-            
+            if (!confirm('Delete this job posting?')) return;
             try {
-                const response = await fetch(`/admin/jobs/${id}`, {
-                    method: 'DELETE'
+                const response = await fetch(`/employer/jobs/${id}`, { method: 'DELETE' });
+                if (response.ok) location.reload();
+                else alert('Error deleting job');
+            } catch (err) {
+                alert('Error: ' + err.message);
+            }
+        }
+        
+        async function updateStatus(resumeId, status) {
+            try {
+                const response = await fetch(`/employer/candidates/${resumeId}/status`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ status: status })
                 });
-                
                 if (response.ok) {
+                    alert('Status updated!');
                     location.reload();
-                } else if (response.status === 401) {
-                    alert('Session expired. Please login again.');
-                    window.location.href = '/admin/login';
-                } else {
-                    alert('Error deleting job');
                 }
             } catch (err) {
                 alert('Error: ' + err.message);
             }
         }
         
+        // Check for new matches every 30 seconds
+        setInterval(async () => {
+            try {
+                const response = await fetch('/employer/notifications');
+                const data = await response.json();
+                if (data.new_matches > 0) {
+                    document.getElementById('notification').classList.add('show');
+                    setTimeout(() => {
+                        document.getElementById('notification').classList.remove('show');
+                    }, 5000);
+                }
+            } catch (e) {}
+        }, 30000);
+        
         window.onclick = function(e) {
-            if (e.target.classList.contains('modal')) {
-                closeModal();
+            if (e.target.classList.contains('modal')) closeModal();
+        }
+    </script>
+</body>
+</html>
+"""
+
+GRADUATE_DASHBOARD_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>My Dashboard - ATS System</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f5f7fa;
+            min-height: 100vh;
+        }
+        .navbar {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px 40px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .navbar h1 { font-size: 1.5em; }
+        .nav-links a {
+            color: white;
+            text-decoration: none;
+            margin-left: 30px;
+            opacity: 0.9;
+        }
+        .nav-links a:hover { opacity: 1; }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 40px;
+        }
+        .welcome {
+            margin-bottom: 30px;
+        }
+        .welcome h2 { color: #333; margin-bottom: 5px; }
+        .welcome p { color: #666; }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+        .stat-card {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+        }
+        .stat-card h3 {
+            color: #666;
+            font-size: 0.85em;
+            text-transform: uppercase;
+            margin-bottom: 10px;
+        }
+        .stat-card .number {
+            font-size: 2.2em;
+            color: #667eea;
+            font-weight: bold;
+        }
+        .section {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+        }
+        .section h2 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+        .btn {
+            padding: 12px 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 0.95em;
+            text-decoration: none;
+            display: inline-block;
+            font-weight: 600;
+        }
+        .match-card {
+            border: 1px solid #eee;
+            border-radius: 12px;
+            padding: 25px;
+            margin-bottom: 15px;
+            transition: transform 0.2s;
+        }
+        .match-card:hover {
+            transform: translateX(5px);
+            border-color: #667eea;
+        }
+        .match-card h3 { color: #333; margin-bottom: 8px; }
+        .match-card .company { color: #667eea; font-weight: 600; margin-bottom: 5px; }
+        .match-card p { color: #666; font-size: 0.9em; margin-bottom: 10px; }
+        .score-badge {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 0.9em;
+        }
+        .score-high { background: #d4edda; color: #155724; }
+        .score-medium { background: #fff3cd; color: #856404; }
+        .progress-bar {
+            width: 100%;
+            height: 10px;
+            background: #e0e0e0;
+            border-radius: 5px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 5px;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            font-weight: 600;
+        }
+        .status-matched { background: #d4edda; color: #155724; }
+        .status-interview { background: #cce5ff; color: #004085; }
+        .status-hired { background: #d1ecf1; color: #0c5460; }
+        .status-rejected { background: #f8d7da; color: #721c24; }
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #666;
+        }
+        .empty-state .icon { font-size: 4em; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <h1>🎓 Graduate Portal</h1>
+        <div class="nav-links">
+            <a href="/graduate/dashboard">Dashboard</a>
+            <a href="/graduate/upload-resume">Upload Resume</a>
+            <a href="/logout">Logout</a>
+        </div>
+    </div>
+    
+    <div class="container">
+        <div class="welcome">
+            <h2>Welcome, {{ user.full_name }}</h2>
+            <p>{{ user.email }}</p>
+        </div>
+        
+        <div class="stats">
+            <div class="stat-card">
+                <h3>Resumes Uploaded</h3>
+                <div class="number">{{ stats.total_resumes }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Job Matches</h3>
+                <div class="number">{{ stats.total_matches }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Interviews</h3>
+                <div class="number">{{ stats.interviews }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Pending</h3>
+                <div class="number">{{ stats.pending }}</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>📄 Upload New Resume</h2>
+            <p style="color: #666; margin-bottom: 20px;">Upload an updated resume to get new job matches</p>
+            <a href="/graduate/upload-resume" class="btn">Upload Resume</a>
+        </div>
+        
+        <div class="section">
+            <h2>🎯 Your Job Matches</h2>
+            {% if matches %}
+                {% for match in matches %}
+                <div class="match-card">
+                    <h3>{{ match.job_title }}</h3>
+                    <div class="company">🏢 {{ match.company_name }} — {{ match.department or 'N/A' }}</div>
+                    <p>📍 {{ match.location or 'Location not specified' }}</p>
+                    <div style="display: flex; align-items: center; gap: 15px; margin: 10px 0;">
+                        <span class="score-badge score-high">{{ "%.1f"|format(match.match_score * 100) }}% Match</span>
+                        <span class="status-badge status-{{ match.status }}">{{ match.status.title() }}</span>
+                    </div>
+                    <div class="progress-bar" style="width: 200px;">
+                        <div class="progress-fill" style="width: {{ match.match_score * 100 }}%"></div>
+                    </div>
+                    <p style="margin-top: 10px; font-size: 0.85em; color: #888;">Matched on {{ match.matched_at }}</p>
+                </div>
+                {% endfor %}
+            {% else %}
+            <div class="empty-state">
+                <div class="icon">🔍</div>
+                <h3>No matches yet</h3>
+                <p>Upload your resume and we'll match you with the perfect jobs!</p>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+RECRUITER_DASHBOARD_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Recruiter Dashboard - ATS System</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f5f7fa;
+            min-height: 100vh;
+        }
+        .navbar {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: white;
+            padding: 20px 40px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .navbar h1 { font-size: 1.5em; }
+        .nav-links a {
+            color: white;
+            text-decoration: none;
+            margin-left: 30px;
+            opacity: 0.9;
+        }
+        .nav-links a:hover { opacity: 1; }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 40px;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+        .stat-card {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+        }
+        .stat-card h3 {
+            color: #666;
+            font-size: 0.85em;
+            text-transform: uppercase;
+            margin-bottom: 10px;
+        }
+        .stat-card .number {
+            font-size: 2.2em;
+            color: #1a1a2e;
+            font-weight: bold;
+        }
+        .section {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+        }
+        .section h2 {
+            color: #333;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .btn {
+            padding: 10px 25px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 0.9em;
+            text-decoration: none;
+            display: inline-block;
+        }
+        .btn-danger { background: #e74c3c; }
+        .btn-warning { background: #f39c12; }
+        .btn-sm { padding: 5px 15px; font-size: 0.8em; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            text-align: left;
+            padding: 15px;
+            border-bottom: 1px solid #eee;
+        }
+        th {
+            color: #666;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.85em;
+        }
+        tr:hover { background: #f8f9fa; }
+        .badge {
+            padding: 5px 12px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            font-weight: 600;
+        }
+        .badge-employer { background: #e3f2fd; color: #1565c0; }
+        .badge-graduate { background: #f3e5f5; color: #6a1b9a; }
+        .badge-recruiter { background: #fff3e0; color: #e65100; }
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 10px;
+        }
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            border-radius: 8px;
+            font-weight: 600;
+            color: #666;
+        }
+        .tab.active {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <h1>👔 Recruiter Admin</h1>
+        <div class="nav-links">
+            <a href="/recruiter/dashboard">Dashboard</a>
+            <a href="/logout">Logout</a>
+        </div>
+    </div>
+    
+    <div class="container">
+        <div class="stats">
+            <div class="stat-card">
+                <h3>Total Employers</h3>
+                <div class="number">{{ stats.total_employers }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Total Graduates</h3>
+                <div class="number">{{ stats.total_graduates }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Total Jobs</h3>
+                <div class="number">{{ stats.total_jobs }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Total Matches</h3>
+                <div class="number">{{ stats.total_matches }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Pending Reviews</h3>
+                <div class="number">{{ stats.pending_reviews }}</div>
+            </div>
+        </div>
+        
+        <div class="tabs">
+            <div class="tab active" onclick="showTab('employers')">Employers</div>
+            <div class="tab" onclick="showTab('graduates')">Graduates</div>
+            <div class="tab" onclick="showTab('jobs')">All Jobs</div>
+            <div class="tab" onclick="showTab('matches')">All Matches</div>
+        </div>
+        
+        <div id="employers" class="tab-content active">
+            <div class="section">
+                <h2>Registered Employers</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Email</th>
+                            <th>Company</th>
+                            <th>Jobs Posted</th>
+                            <th>Joined</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for emp in employers %}
+                        <tr>
+                            <td><strong>{{ emp.full_name }}</strong></td>
+                            <td>{{ emp.email }}</td>
+                            <td>{{ emp.company_name or 'N/A' }}</td>
+                            <td>{{ emp.job_count }}</td>
+                            <td>{{ emp.created_at }}</td>
+                            <td>
+                                <button class="btn btn-danger btn-sm" onclick="deleteUser({{ emp.id }}, 'employer')">Delete</button>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div id="graduates" class="tab-content">
+            <div class="section">
+                <h2>Registered Graduates</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Email</th>
+                            <th>Resumes</th>
+                            <th>Matches</th>
+                            <th>Joined</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for grad in graduates %}
+                        <tr>
+                            <td><strong>{{ grad.full_name }}</strong></td>
+                            <td>{{ grad.email }}</td>
+                            <td>{{ grad.resume_count }}</td>
+                            <td>{{ grad.match_count }}</td>
+                            <td>{{ grad.created_at }}</td>
+                            <td>
+                                <button class="btn btn-danger btn-sm" onclick="deleteUser({{ grad.id }}, 'graduate')">Delete</button>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div id="jobs" class="tab-content">
+            <div class="section">
+                <h2>All Job Postings</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Title</th>
+                            <th>Employer</th>
+                            <th>Department</th>
+                            <th>Location</th>
+                            <th>Posted</th>
+                            <th>Matches</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for job in all_jobs %}
+                        <tr>
+                            <td><strong>{{ job.title }}</strong></td>
+                            <td>{{ job.employer_name }}</td>
+                            <td>{{ job.department or 'N/A' }}</td>
+                            <td>{{ job.location or 'N/A' }}</td>
+                            <td>{{ job.created_at }}</td>
+                            <td>{{ job.match_count }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div id="matches" class="tab-content">
+            <div class="section">
+                <h2>All Matches</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Candidate</th>
+                            <th>Job</th>
+                            <th>Employer</th>
+                            <th>Score</th>
+                            <th>Status</th>
+                            <th>Date</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for match in all_matches %}
+                        <tr>
+                            <td>{{ match.candidate_name }}</td>
+                            <td>{{ match.job_title }}</td>
+                            <td>{{ match.employer_name }}</td>
+                            <td>{{ "%.1f"|format(match.match_score * 100) }}%</td>
+                            <td><span class="badge badge-{{ match.status }}">{{ match.status }}</span></td>
+                            <td>{{ match.matched_at }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function showTab(tabName) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById(tabName).classList.add('active');
+        }
+        
+        async function deleteUser(userId, role) {
+            if (!confirm(`Delete this ${role}? This cannot be undone.`)) return;
+            try {
+                const response = await fetch(`/recruiter/users/${userId}?role=${role}`, {
+                    method: 'DELETE'
+                });
+                if (response.ok) location.reload();
+                else alert('Error deleting user');
+            } catch (err) {
+                alert('Error: ' + err.message);
             }
         }
     </script>
@@ -862,18 +1669,18 @@ RESUME_UPLOAD_TEMPLATE = """
         
         <div id="successMsg" class="success-message">
             <strong>✅ Success!</strong><br>
-            Your resume has been uploaded. Check your email for matching results!
+            Your resume has been uploaded. Check your dashboard for matching results!
         </div>
         
         <form id="resumeForm" onsubmit="submitResume(event)">
             <div class="form-group">
                 <label>Full Name</label>
-                <input type="text" name="full_name" required placeholder="John Doe">
+                <input type="text" name="full_name" required placeholder="John Doe" value="{{ user.full_name }}">
             </div>
             
             <div class="form-group">
                 <label>Email Address</label>
-                <input type="email" name="email" required placeholder="john@example.com">
+                <input type="email" name="email" required placeholder="john@example.com" value="{{ user.email }}">
             </div>
             
             <div class="form-group">
@@ -893,7 +1700,7 @@ RESUME_UPLOAD_TEMPLATE = """
             </button>
         </form>
         
-        <a href="/" class="back-link">← Back to Home</a>
+        <a href="/graduate/dashboard" class="back-link">← Back to Dashboard</a>
     </div>
     
     <script>
@@ -920,7 +1727,7 @@ RESUME_UPLOAD_TEMPLATE = """
             const formData = new FormData(e.target);
             
             try {
-                const response = await fetch('/upload-resume', {
+                const response = await fetch('/graduate/upload-resume', {
                     method: 'POST',
                     body: formData
                 });
@@ -932,6 +1739,9 @@ RESUME_UPLOAD_TEMPLATE = """
                     document.getElementById('resumeForm').reset();
                     document.getElementById('fileLabel').classList.remove('has-file');
                     document.getElementById('fileLabel').innerHTML = '<div>📁 Click to upload PDF</div><small>Maximum file size: 10MB</small>';
+                    setTimeout(() => {
+                        window.location.href = '/graduate/dashboard';
+                    }, 2000);
                 } else {
                     alert('Error: ' + (result.detail || 'Something went wrong'));
                 }
@@ -948,14 +1758,161 @@ RESUME_UPLOAD_TEMPLATE = """
 </html>
 """
 
-# Write templates to files
+CANDIDATE_DETAIL_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Candidate Details - ATS System</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f5f7fa;
+            min-height: 100vh;
+        }
+        .navbar {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px 40px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .navbar a { color: white; text-decoration: none; }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 40px;
+        }
+        .candidate-header {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+        }
+        .candidate-header h1 { color: #333; margin-bottom: 10px; }
+        .candidate-header p { color: #666; margin-bottom: 5px; }
+        .score-display {
+            font-size: 3em;
+            color: #667eea;
+            font-weight: bold;
+            text-align: center;
+            margin: 20px 0;
+        }
+        .section {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+        }
+        .section h2 { color: #333; margin-bottom: 15px; }
+        .section pre {
+            white-space: pre-wrap;
+            font-family: inherit;
+            color: #555;
+            line-height: 1.6;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .actions {
+            display: flex;
+            gap: 15px;
+            margin-top: 20px;
+        }
+        .btn {
+            padding: 12px 30px;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 1em;
+            font-weight: 600;
+            text-decoration: none;
+            display: inline-block;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        .btn-success { background: #28a745; color: white; }
+        .btn-warning { background: #f39c12; color: white; }
+        .btn-danger { background: #e74c3c; color: white; }
+        .status-form {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        select {
+            padding: 10px;
+            border-radius: 8px;
+            border: 2px solid #ddd;
+            font-size: 1em;
+        }
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <h1>👤 Candidate Profile</h1>
+        <a href="/employer/dashboard">← Back to Dashboard</a>
+    </div>
+    
+    <div class="container">
+        <div class="candidate-header">
+            <h1>{{ candidate.full_name }}</h1>
+            <p>📧 {{ candidate.email }}</p>
+            <p>🎯 Applied for: <strong>{{ job.title }}</strong></p>
+            <div class="score-display">{{ "%.1f"|format(match.match_score * 100) }}%</div>
+            <p style="text-align: center; color: #666;">Match Score</p>
+        </div>
+        
+        <div class="section">
+            <h2>Update Status</h2>
+            <form action="/employer/candidates/{{ candidate.id }}/status" method="post" class="status-form">
+                <input type="hidden" name="job_id" value="{{ job.id }}">
+                <select name="status">
+                    <option value="matched" {% if match.status == 'matched' %}selected{% endif %}>Matched</option>
+                    <option value="reviewing" {% if match.status == 'reviewing' %}selected{% endif %}>Reviewing</option>
+                    <option value="interview" {% if match.status == 'interview' %}selected{% endif %}>Interview Scheduled</option>
+                    <option value="hired" {% if match.status == 'hired' %}selected{% endif %}>Hired</option>
+                    <option value="rejected" {% if match.status == 'rejected' %}selected{% endif %}>Rejected</option>
+                </select>
+                <button type="submit" class="btn btn-primary">Update Status</button>
+            </form>
+        </div>
+        
+        <div class="section">
+            <h2>Resume Content</h2>
+            <pre>{{ candidate.resume_text }}</pre>
+        </div>
+        
+        <div class="section">
+            <h2>Actions</h2>
+            <div class="actions">
+                <a href="mailto:{{ candidate.email }}?subject=Regarding your application for {{ job.title }}" class="btn btn-success">📧 Email Candidate</a>
+                <a href="/employer/dashboard" class="btn btn-primary">← Back to Dashboard</a>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+# ============== TEMPLATE SETUP ==============
+
 def setup_templates():
     """Write HTML templates to temporary files"""
     templates = {
         "index.html": INDEX_TEMPLATE,
-        "admin_login.html": ADMIN_LOGIN_TEMPLATE,
-        "admin_dashboard.html": ADMIN_DASHBOARD_TEMPLATE,
-        "resume_upload.html": RESUME_UPLOAD_TEMPLATE
+        "signup.html": SIGNUP_TEMPLATE,
+        "login.html": LOGIN_TEMPLATE,
+        "employer_dashboard.html": EMPLOYER_DASHBOARD_TEMPLATE,
+        "graduate_dashboard.html": GRADUATE_DASHBOARD_TEMPLATE,
+        "recruiter_dashboard.html": RECRUITER_DASHBOARD_TEMPLATE,
+        "resume_upload.html": RESUME_UPLOAD_TEMPLATE,
+        "candidate_detail.html": CANDIDATE_DETAIL_TEMPLATE,
     }
     
     for filename, content in templates.items():
@@ -965,50 +1922,177 @@ def setup_templates():
     
     return TEMPLATES_DIR
 
-# Database setup - ASYNC VERSION
+# ============== DATABASE ==============
+
 async def init_database():
     """Initialize SQLite database with required tables"""
     async with aiosqlite.connect(DATABASE_FILE) as db:
+        # Users table (unified for all roles)
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS job_descriptions (
+            CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                description TEXT NOT NULL,
-                department TEXT,
-                location TEXT,
-                embedding BLOB,
-                embedding_created BOOLEAN DEFAULT 0,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                full_name TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('recruiter', 'employer', 'graduate')),
+                company_name TEXT,
+                phone TEXT,
+                is_active BOOLEAN DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
+        # Job descriptions (now linked to employer)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS job_descriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                employer_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                department TEXT,
+                location TEXT,
+                requirements TEXT,
+                salary_range TEXT,
+                embedding BLOB,
+                embedding_created BOOLEAN DEFAULT 0,
+                is_active BOOLEAN DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (employer_id) REFERENCES users(id)
+            )
+        """)
+        
+        # Resumes (linked to graduate user)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS resumes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
                 full_name TEXT NOT NULL,
                 email TEXT NOT NULL,
                 resume_text TEXT NOT NULL,
                 embedding BLOB,
                 status TEXT DEFAULT 'pending',
-                matched_job_id INTEGER,
-                match_score REAL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (matched_job_id) REFERENCES job_descriptions(id)
+                FOREIGN KEY (user_id) REFERENCES users(id)
             )
         """)
         
+        # Matches table (explicit many-to-many with status tracking)
         await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_resumes_status ON resumes(status)
-        """)
-        await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_resumes_email ON resumes(email)
+            CREATE TABLE IF NOT EXISTS matches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                resume_id INTEGER NOT NULL,
+                job_id INTEGER NOT NULL,
+                employer_id INTEGER NOT NULL,
+                match_score REAL NOT NULL,
+                status TEXT DEFAULT 'matched',
+                notified BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (resume_id) REFERENCES resumes(id),
+                FOREIGN KEY (job_id) REFERENCES job_descriptions(id),
+                FOREIGN KEY (employer_id) REFERENCES users(id),
+                UNIQUE(resume_id, job_id)
+            )
         """)
         
+        # Notifications table
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                is_read BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        
+        # Create indexes
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_resumes_user ON resumes(user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_resumes_status ON resumes(status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_employer ON job_descriptions(employer_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_matches_resume ON matches(resume_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_matches_job ON matches(job_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_matches_employer ON matches(employer_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id)")
+        
         await db.commit()
+        
+        # Create default recruiter if not exists
+        cursor = await db.execute("SELECT id FROM users WHERE role = 'recruiter' LIMIT 1")
+        if not await cursor.fetchone():
+            hashed = pwd_context.hash("recruiter123")
+            await db.execute("""
+                INSERT INTO users (email, password_hash, full_name, role, company_name)
+                VALUES (?, ?, ?, ?, ?)
+            """, ("recruiter@ats.com", hashed, "System Recruiter", "recruiter", "ATS Platform"))
+            await db.commit()
+            print("Created default recruiter: recruiter@ats.com / recruiter123")
 
-# PDF Processing
+# ============== AUTH HELPERS ==============
+
+def create_session(user_id: int, role: str) -> str:
+    """Create a secure session token"""
+    session_id = secrets.token_urlsafe(32)
+    active_sessions[session_id] = {
+        "user_id": user_id,
+        "role": role,
+        "created_at": datetime.utcnow()
+    }
+    return session_id
+
+def get_session(session_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Get session data if valid"""
+    if not session_id or session_id not in active_sessions:
+        return None
+    session = active_sessions[session_id]
+    # Check expiry (24 hours)
+    if datetime.utcnow() - session["created_at"] > timedelta(hours=24):
+        del active_sessions[session_id]
+        return None
+    return session
+
+async def get_current_user(request: Request, required_role: Optional[UserRole] = None):
+    """Get current user from session with optional role check"""
+    session_id = request.cookies.get("session_id")
+    session = get_session(session_id)
+    
+    if not session:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    if required_role and session["role"] != required_role.value:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM users WHERE id = ?", (session["user_id"],))
+        user = await cursor.fetchone()
+        
+    if not user or not user["is_active"]:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+    
+    return dict(user)
+
+async def get_recruiter(request: Request):
+    return await get_current_user(request, UserRole.RECRUITER)
+
+async def get_employer(request: Request):
+    return await get_current_user(request, UserRole.EMPLOYER)
+
+async def get_graduate(request: Request):
+    return await get_current_user(request, UserRole.GRADUATE)
+
+async def get_any_user(request: Request):
+    return await get_current_user(request)
+
+# ============== PDF & EMAIL ==============
+
 def extract_text_from_pdf(pdf_file: bytes) -> str:
     """Extract text from PDF file"""
     try:
@@ -1020,12 +2104,10 @@ def extract_text_from_pdf(pdf_file: bytes) -> str:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error processing PDF: {str(e)}")
 
-# Email Service
 async def send_email(to_email: str, subject: str, body: str, html_body: Optional[str] = None):
     """Send email notification"""
     if not SMTP_USER or not SMTP_PASS:
-        # Log email instead of sending if SMTP not configured
-        print(f"[EMAIL LOG] To: {to_email}\nSubject: {subject}\nBody: {body}\n")
+        print(f"[EMAIL LOG] To: {to_email}\nSubject: {subject}\nBody: {body[:200]}...\n")
         return True
     
     try:
@@ -1034,10 +2116,7 @@ async def send_email(to_email: str, subject: str, body: str, html_body: Optional
         message["To"] = to_email
         message["Subject"] = subject
         
-        # Add plain text part
         message.attach(MIMEText(body, "plain"))
-        
-        # Add HTML part if provided
         if html_body:
             message.attach(MIMEText(html_body, "html"))
         
@@ -1054,10 +2133,10 @@ async def send_email(to_email: str, subject: str, body: str, html_body: Optional
         print(f"Failed to send email: {e}")
         return False
 
-# HuggingFace API Embedding - USING SPECIALIZED ATS MODEL
+# ============== EMBEDDINGS ==============
+
 async def create_embedding_api(text: str) -> bytes:
-    """Create embedding using HuggingFace Inference API with specialized ATS model"""
-    # Truncate text to avoid API limits
+    """Create embedding using HuggingFace Inference API"""
     max_chars = 5000
     if len(text) > max_chars:
         text = text[:max_chars]
@@ -1066,7 +2145,6 @@ async def create_embedding_api(text: str) -> bytes:
     if HF_API_TOKEN:
         headers["Authorization"] = f"Bearer {HF_API_TOKEN}"
     
-    # Try specialized ATS model first
     try:
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1077,23 +2155,19 @@ async def create_embedding_api(text: str) -> bytes:
             ) as response:
                 if response.status == 200:
                     result = await response.json()
-                    # Result is a list of embeddings (one per token), take mean
                     if isinstance(result, list) and len(result) > 0:
                         if isinstance(result[0], list):
-                            # Mean pooling of all token embeddings
                             embedding = np.mean(result, axis=0)
                         else:
                             embedding = np.array(result)
-                        print(f"Successfully generated embedding using specialized ATS model, shape: {embedding.shape}")
                         return pickle.dumps(embedding)
                     else:
                         raise Exception("Invalid API response format")
                 else:
                     error_text = await response.text()
-                    raise Exception(f"API error: {response.status} - {error_text}")
+                    raise Exception(f"API error: {response.status}")
     except Exception as e:
-        print(f"Specialized ATS model API failed ({e}), trying fallback...")
-        # Fallback to all-MiniLM-L6-v2 if specialized model fails
+        print(f"Primary API failed ({e}), trying fallback...")
         fallback_url = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
         try:
             timeout = aiohttp.ClientTimeout(total=30)
@@ -1110,7 +2184,6 @@ async def create_embedding_api(text: str) -> bytes:
                                 embedding = np.mean(result, axis=0)
                             else:
                                 embedding = np.array(result)
-                            print(f"Successfully generated embedding using fallback model, shape: {embedding.shape}")
                             return pickle.dumps(embedding)
                         else:
                             raise Exception("Invalid fallback API response format")
@@ -1118,16 +2191,14 @@ async def create_embedding_api(text: str) -> bytes:
                         raise Exception(f"Fallback API error: {response.status}")
         except Exception as e2:
             print(f"Fallback API also failed ({e2}), using hash-based embedding")
-            # Final fallback: Create a simple deterministic embedding from text hash
             words = set(text.lower().split())
-            embedding = np.zeros(384)  # Same size as MiniLM
+            embedding = np.zeros(384)
             for i, word in enumerate(list(words)[:384]):
                 hash_val = int(hashlib.md5(word.encode()).hexdigest(), 16)
                 embedding[i] = (hash_val % 1000) / 1000.0
             norm = np.linalg.norm(embedding)
             if norm > 0:
                 embedding = embedding / norm
-            print(f"Generated hash-based fallback embedding, shape: {embedding.shape}")
             return pickle.dumps(embedding)
 
 def get_embedding_from_bytes(embedding_blob: bytes) -> np.ndarray:
@@ -1139,118 +2210,110 @@ def calculate_similarity(embedding1: np.ndarray, embedding2: np.ndarray) -> floa
     similarity = cosine_similarity([embedding1], [embedding2])[0][0]
     return float(similarity)
 
-# Matching Logic - ASYNC VERSION
-async def find_best_job_match(resume_embedding: np.ndarray, db) -> Optional[Dict]:
-    """Find the best matching job for a resume"""
-    
+# ============== MATCHING LOGIC ==============
+
+async def find_matching_jobs(resume_embedding: np.ndarray, db, exclude_job_ids: List[int] = None) -> List[Dict]:
+    """Find all matching jobs for a resume"""
     cursor = await db.execute(
-        "SELECT id, title, description, embedding FROM job_descriptions WHERE embedding_created = 1"
+        "SELECT id, employer_id, title, description, embedding FROM job_descriptions WHERE embedding_created = 1 AND is_active = 1"
     )
     jobs = await cursor.fetchall()
     
-    if not jobs:
-        return None
-    
-    best_match = None
-    best_score = 0.0
-    
+    matches = []
     for job in jobs:
+        if exclude_job_ids and job["id"] in exclude_job_ids:
+            continue
+            
         if job["embedding"]:
             job_embedding = get_embedding_from_bytes(job["embedding"])
             score = calculate_similarity(resume_embedding, job_embedding)
             
-            if score > best_score:
-                best_score = score
-                best_match = {
+            if score >= MATCH_THRESHOLD:
+                matches.append({
                     "job_id": job["id"],
+                    "employer_id": job["employer_id"],
                     "title": job["title"],
                     "description": job["description"],
                     "score": score
-                }
+                })
     
-    return best_match if best_match and best_score >= MATCH_THRESHOLD else None
+    # Sort by score descending
+    matches.sort(key=lambda x: x["score"], reverse=True)
+    return matches
 
-async def process_resume_matching(resume_id: int, background_tasks: BackgroundTasks):
-    """Process resume matching and send notification - ASYNC VERSION"""
+async def process_resume_matching(resume_id: int, user_id: int):
+    """Process resume matching and create match records"""
     
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         
-        # Get resume details
+        # Get resume
         cursor = await db.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,))
         resume = await cursor.fetchone()
         
-        if not resume or resume["status"] != "pending":
+        if not resume:
             return
         
         resume_embedding = get_embedding_from_bytes(resume["embedding"])
         
-        # Find best match
-        match = await find_best_job_match(resume_embedding, db)
+        # Find existing matches to avoid duplicates
+        cursor = await db.execute("SELECT job_id FROM matches WHERE resume_id = ?", (resume_id,))
+        existing = [row["job_id"] for row in await cursor.fetchall()]
         
-        if match:
-            # Update resume with match
+        # Find matching jobs
+        matches = await find_matching_jobs(resume_embedding, db, existing)
+        
+        for match in matches:
+            # Create match record
             await db.execute("""
-                UPDATE resumes 
-                SET status = 'matched', 
-                    matched_job_id = ?, 
-                    match_score = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (match["job_id"], match["score"], resume_id))
+                INSERT INTO matches (resume_id, job_id, employer_id, match_score, status)
+                VALUES (?, ?, ?, ?, 'matched')
+            """, (resume_id, match["job_id"], match["employer_id"], match["score"]))
             
-            # Send match notification
-            subject = f"Great News! Job Match Found - {match['title']}"
-            body = f"""
-Dear {resume["full_name"]},
+            # Notify employer
+            await db.execute("""
+                INSERT INTO notifications (user_id, type, message)
+                VALUES (?, 'new_match', ?)
+            """, (match["employer_id"], f"New candidate match for {match['title']}: {resume['full_name']} ({match['score']*100:.1f}%)"))
+            
+            # Get employer email
+            cursor = await db.execute("SELECT email FROM users WHERE id = ?", (match["employer_id"],))
+            employer = await cursor.fetchone()
+            
+            if employer:
+                subject = f"🎯 New Candidate Match: {match['title']}"
+                body = f"""
+Dear Employer,
 
-We found a job that matches your profile!
+A new candidate has matched your job posting!
 
 Position: {match['title']}
+Candidate: {resume['full_name']}
 Match Score: {match['score']*100:.1f}%
 
-Job Description:
-{match['description'][:500]}...
-
-Our team will contact you shortly with next steps.
+View the candidate in your dashboard: /employer/dashboard
 
 Best regards,
 ATS Recruitment Team
 """
-            html_body = f"""
-<html>
-<body>
-    <h2>Great News! Job Match Found</h2>
-    <p>Dear {resume["full_name"]},</p>
-    <p>We found a job that matches your profile!</p>
-    <h3>Position: {match['title']}</h3>
-    <p><strong>Match Score: {match['score']*100:.1f}%</strong></p>
-    <p>{match['description'][:500]}...</p>
-    <p>Our team will contact you shortly with next steps.</p>
-    <br>
-    <p>Best regards,<br>ATS Recruitment Team</p>
-</body>
-</html>
-"""
-            await send_email(resume["email"], subject, body, html_body)
-            
-        else:
-            # No match found
+                await send_email(employer["email"], subject, body)
+        
+        # Update resume status
+        if matches:
             await db.execute("""
-                UPDATE resumes 
-                SET status = 'notified_no_match',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
+                UPDATE resumes SET status = 'matched', updated_at = CURRENT_TIMESTAMP WHERE id = ?
+            """, (resume_id,))
+        else:
+            await db.execute("""
+                UPDATE resumes SET status = 'notified_no_match', updated_at = CURRENT_TIMESTAMP WHERE id = ?
             """, (resume_id,))
             
-            # Send no-match notification
+            # Notify graduate of no match
             subject = "Application Received - Updates Coming Soon"
             body = f"""
-Dear {resume["full_name"]},
+Dear {resume['full_name']},
 
-Thank you for submitting your resume to our system.
-
-We've reviewed your profile and while we don't currently have an opening that matches your qualifications at the 80% threshold, we are continuously adding new positions.
+Thank you for submitting your resume. While we don't currently have an opening that matches your qualifications at the 80% threshold, we are continuously adding new positions.
 
 You will receive an automatic notification as soon as a matching position becomes available.
 
@@ -1261,14 +2324,17 @@ ATS Recruitment Team
         
         await db.commit()
 
-async def reprocess_pending_resumes(new_job_id: int, background_tasks: BackgroundTasks):
-    """Reprocess pending resumes when new job is added - ASYNC VERSION"""
+async def reprocess_pending_resumes(new_job_id: int, employer_id: int):
+    """Reprocess pending resumes when new job is added"""
     
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         
         # Get new job embedding
-        cursor = await db.execute("SELECT embedding FROM job_descriptions WHERE id = ?", (new_job_id,))
+        cursor = await db.execute(
+            "SELECT embedding, title, description FROM job_descriptions WHERE id = ? AND employer_id = ?", 
+            (new_job_id, employer_id)
+        )
         job = await cursor.fetchone()
         
         if not job or not job["embedding"]:
@@ -1276,91 +2342,75 @@ async def reprocess_pending_resumes(new_job_id: int, background_tasks: Backgroun
         
         job_embedding = get_embedding_from_bytes(job["embedding"])
         
-        # Get all pending resumes
-        cursor = await db.execute("SELECT * FROM resumes WHERE status = 'pending'")
+        # Get all pending resumes not already matched to this job
+        cursor = await db.execute("""
+            SELECT r.* FROM resumes r
+            WHERE r.status = 'pending'
+            AND r.id NOT IN (SELECT resume_id FROM matches WHERE job_id = ?)
+        """, (new_job_id,))
         pending_resumes = await cursor.fetchall()
         
+        new_matches = 0
         for resume in pending_resumes:
             if resume["embedding"]:
                 resume_embedding = get_embedding_from_bytes(resume["embedding"])
                 score = calculate_similarity(job_embedding, resume_embedding)
                 
                 if score >= MATCH_THRESHOLD:
-                    # Update and notify
+                    # Create match
                     await db.execute("""
-                        UPDATE resumes 
-                        SET status = 'matched', 
-                            matched_job_id = ?, 
-                            match_score = ?,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?
-                    """, (new_job_id, score, resume["id"]))
+                        INSERT INTO matches (resume_id, job_id, employer_id, match_score, status)
+                        VALUES (?, ?, ?, ?, 'matched')
+                    """, (resume["id"], new_job_id, employer_id, score))
                     
-                    # Get job details for email
-                    cursor = await db.execute("SELECT title, description FROM job_descriptions WHERE id = ?", (new_job_id,))
-                    job_details = await cursor.fetchone()
+                    # Notify employer
+                    await db.execute("""
+                        INSERT INTO notifications (user_id, type, message)
+                        VALUES (?, 'new_match', ?)
+                    """, (employer_id, f"New candidate match for {job['title']}: {resume['full_name']} ({score*100:.1f}%)"))
                     
-                    # Send notification
-                    subject = f"New Job Match Found! - {job_details['title']}"
-                    body = f"""
-Dear {resume["full_name"]},
+                    new_matches += 1
+        
+        await db.commit()
+        
+        if new_matches > 0:
+            # Get employer email
+            cursor = await db.execute("SELECT email FROM users WHERE id = ?", (employer_id,))
+            employer = await cursor.fetchone()
+            if employer:
+                subject = f"🎯 {new_matches} New Candidate(s) Matched!"
+                body = f"""
+Your new job posting has received {new_matches} candidate match(es)!
 
-Great news! A new position matching your profile has been posted.
-
-Position: {job_details['title']}
-Match Score: {score*100:.1f}%
-
-{job_details['description'][:500]}...
-
-Our team will contact you shortly.
+View them in your employer dashboard.
 
 Best regards,
 ATS Recruitment Team
 """
-                    await send_email(resume["email"], subject, body)
-        
-        await db.commit()
+                await send_email(employer["email"], subject, body)
 
-# Session-based authentication
-async def get_current_admin(request: Request):
-    """Check if admin is logged in via session cookie"""
-    admin_session = request.cookies.get("admin_session")
-    if admin_session != "authenticated":
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    return "admin"
+# ============== FASTAPI APP ==============
 
-# FastAPI Application
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler"""
-    
-    # Setup templates
     setup_templates()
-    
-    # Startup - async init
     print("Initializing database...")
     await init_database()
-    
-    print(f"Using HuggingFace Inference API with specialized ATS model: 0xnbk/nbk-ats-semantic-v1-en")
-    print("Model runs on HF servers - zero memory usage on this instance")
-    
+    print("Multi-role ATS system initialized")
     yield
-    
-    # Cleanup
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
     print("Shutting down...")
 
 app = FastAPI(
-    title="ATS Semantic Matching API",
-    description="AI-powered Applicant Tracking System using specialized ATS model via HuggingFace API",
-    version="2.1.0",
+    title="ATS Semantic Matching API - Multi-Role",
+    description="AI-powered ATS with Recruiter, Employer, and Graduate roles",
+    version="3.0.0",
     lifespan=lifespan
 )
 
-# Setup Jinja2 templates
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1369,159 +2419,346 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Frontend Routes
+# ============== PUBLIC ROUTES ==============
+
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     """Home page"""
     return templates.TemplateResponse("index.html", {"request": request})
 
-@app.get("/submit-resume", response_class=HTMLResponse)
-async def submit_resume_page(request: Request):
-    """Resume upload page"""
-    return templates.TemplateResponse("resume_upload.html", {"request": request})
+@app.get("/signup", response_class=HTMLResponse)
+async def signup_page(request: Request, role: str = "graduate", error: Optional[str] = None, success: Optional[str] = None):
+    """Signup page"""
+    if role not in ["employer", "graduate"]:
+        role = "graduate"
+    return templates.TemplateResponse("signup.html", {
+        "request": request, 
+        "role": role,
+        "error": error,
+        "success": success
+    })
 
-@app.get("/admin/login", response_class=HTMLResponse)
-async def admin_login_page(request: Request, error: Optional[str] = None):
-    """Admin login page"""
-    return templates.TemplateResponse("admin_login.html", {"request": request, "error": error})
+@app.post("/signup")
+async def signup(
+    request: Request,
+    email: str = Form(...),
+    password: str = Form(...),
+    full_name: str = Form(...),
+    role: str = Form(...),
+    company_name: Optional[str] = Form(None),
+    phone: Optional[str] = Form(None)
+):
+    """Handle signup"""
+    if role not in ["employer", "graduate"]:
+        return templates.TemplateResponse("signup.html", {
+            "request": request,
+            "role": role,
+            "error": "Invalid role selected"
+        })
+    
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        # Check if email exists
+        cursor = await db.execute("SELECT id FROM users WHERE email = ?", (email,))
+        if await cursor.fetchone():
+            return templates.TemplateResponse("signup.html", {
+                "request": request,
+                "role": role,
+                "error": "Email already registered"
+            })
+        
+        # Hash password
+        password_hash = pwd_context.hash(password)
+        
+        await db.execute("""
+            INSERT INTO users (email, password_hash, full_name, role, company_name, phone)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (email, password_hash, full_name, role, company_name, phone))
+        await db.commit()
+    
+    return templates.TemplateResponse("signup.html", {
+        "request": request,
+        "role": role,
+        "success": "Account created successfully! Please login."
+    })
 
-@app.post("/admin/login")
-async def admin_login(request: Request, username: str = Form(...), password: str = Form(...)):
-    """Process admin login - set session cookie"""
-    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
-        response = RedirectResponse(url="/admin/dashboard", status_code=302)
-        response.set_cookie(key="admin_session", value="authenticated", httponly=True, max_age=3600)
-        return response
-    else:
-        return templates.TemplateResponse(
-            "admin_login.html", 
-            {"request": request, "error": "Invalid username or password"}
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, role: str = "graduate", error: Optional[str] = None):
+    """Login page"""
+    return templates.TemplateResponse("login.html", {
+        "request": request,
+        "role": role,
+        "error": error
+    })
+
+@app.post("/login")
+async def login(
+    request: Request,
+    email: str = Form(...),
+    password: str = Form(...),
+    role: str = Form(...)
+):
+    """Handle login"""
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM users WHERE email = ? AND role = ?", 
+            (email, role)
         )
+        user = await cursor.fetchone()
+        
+        if not user or not pwd_context.verify(password, user["password_hash"]):
+            return templates.TemplateResponse("login.html", {
+                "request": request,
+                "role": role,
+                "error": "Invalid email or password"
+            })
+        
+        if not user["is_active"]:
+            return templates.TemplateResponse("login.html", {
+                "request": request,
+                "role": role,
+                "error": "Account is deactivated"
+            })
+        
+        # Create session
+        session_id = create_session(user["id"], user["role"])
+        
+        # Redirect based on role
+        if role == "recruiter":
+            redirect_url = "/recruiter/dashboard"
+        elif role == "employer":
+            redirect_url = "/employer/dashboard"
+        else:
+            redirect_url = "/graduate/dashboard"
+        
+        response = RedirectResponse(url=redirect_url, status_code=302)
+        response.set_cookie(
+            key="session_id", 
+            value=session_id, 
+            httponly=True, 
+            max_age=86400,
+            samesite="lax"
+        )
+        return response
 
-@app.get("/admin/logout")
-async def admin_logout():
-    """Logout admin"""
+@app.get("/logout")
+async def logout():
+    """Logout"""
     response = RedirectResponse(url="/", status_code=302)
-    response.delete_cookie(key="admin_session")
+    response.delete_cookie(key="session_id")
     return response
 
-@app.get("/admin/dashboard", response_class=HTMLResponse)
-async def admin_dashboard(request: Request, admin: str = Depends(get_current_admin)):
-    """Admin dashboard"""
-    
+# ============== GRADUATE ROUTES ==============
+
+@app.get("/graduate/dashboard", response_class=HTMLResponse)
+async def graduate_dashboard(request: Request, user: Dict = Depends(get_graduate)):
+    """Graduate dashboard"""
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         
-        # Get stats
-        cursor = await db.execute("SELECT COUNT(*) as count FROM job_descriptions")
-        total_jobs = (await cursor.fetchone())["count"]
-        
-        cursor = await db.execute("SELECT COUNT(*) as count FROM resumes")
+        # Stats
+        cursor = await db.execute("SELECT COUNT(*) as count FROM resumes WHERE user_id = ?", (user["id"],))
         total_resumes = (await cursor.fetchone())["count"]
         
-        cursor = await db.execute("SELECT COUNT(*) as count FROM resumes WHERE status = 'matched'")
-        matched = (await cursor.fetchone())["count"]
+        cursor = await db.execute("""
+            SELECT COUNT(*) as count FROM matches m
+            JOIN resumes r ON m.resume_id = r.id
+            WHERE r.user_id = ?
+        """, (user["id"],))
+        total_matches = (await cursor.fetchone())["count"]
         
-        cursor = await db.execute("SELECT COUNT(*) as count FROM resumes WHERE status = 'pending'")
+        cursor = await db.execute("""
+            SELECT COUNT(*) as count FROM matches m
+            JOIN resumes r ON m.resume_id = r.id
+            WHERE r.user_id = ? AND m.status = 'interview'
+        """, (user["id"],))
+        interviews = (await cursor.fetchone())["count"]
+        
+        cursor = await db.execute("""
+            SELECT COUNT(*) as count FROM resumes WHERE user_id = ? AND status = 'pending'
+        """, (user["id"],))
         pending = (await cursor.fetchone())["count"]
         
-        # Get jobs
+        # Matches with job details
         cursor = await db.execute("""
-            SELECT id, title, description, department, location, created_at 
-            FROM job_descriptions 
-            ORDER BY created_at DESC
-        """)
-        jobs = await cursor.fetchall()
-        
-        # Get resumes with job titles
-        cursor = await db.execute("""
-            SELECT r.*, j.title as job_title 
-            FROM resumes r
-            LEFT JOIN job_descriptions j ON r.matched_job_id = j.id
-            ORDER BY r.created_at DESC
-            LIMIT 50
-        """)
-        resumes = await cursor.fetchall()
+            SELECT m.*, j.title as job_title, j.department, j.location, 
+                   u.company_name, m.created_at as matched_at
+            FROM matches m
+            JOIN job_descriptions j ON m.job_id = j.id
+            JOIN users u ON j.employer_id = u.id
+            JOIN resumes r ON m.resume_id = r.id
+            WHERE r.user_id = ?
+            ORDER BY m.match_score DESC
+        """, (user["id"],))
+        matches = await cursor.fetchall()
     
-    return templates.TemplateResponse("admin_dashboard.html", {
+    return templates.TemplateResponse("graduate_dashboard.html", {
         "request": request,
+        "user": user,
         "stats": {
-            "total_jobs": total_jobs,
             "total_resumes": total_resumes,
-            "matched": matched,
+            "total_matches": total_matches,
+            "interviews": interviews,
             "pending": pending
         },
-        "jobs": jobs,
-        "resumes": resumes
+        "matches": matches
     })
 
-# API Endpoints
-@app.post("/admin/jobs", response_model=JobDescriptionResponse)
-async def create_job_description(
-    job: JobDescriptionCreate,
+@app.get("/graduate/upload-resume", response_class=HTMLResponse)
+async def graduate_upload_page(request: Request, user: Dict = Depends(get_graduate)):
+    """Resume upload page for graduates"""
+    return templates.TemplateResponse("resume_upload.html", {
+        "request": request,
+        "user": user
+    })
+
+@app.post("/graduate/upload-resume")
+async def graduate_upload_resume(
+    request: Request,
     background_tasks: BackgroundTasks,
-    admin: str = Depends(get_current_admin)
+    full_name: str = Form(...),
+    email: EmailStr = Form(...),
+    resume_file: UploadFile = File(...),
+    user: Dict = Depends(get_graduate)
 ):
-    """Create job description - uses HF API with specialized ATS model"""
+    """Upload resume for graduate"""
+    if not resume_file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
     
-    # Create embedding via API (specialized ATS model)
-    embedding = await create_embedding_api(job.description)
+    contents = await resume_file.read()
+    resume_text = extract_text_from_pdf(contents)
+    
+    if not resume_text or len(resume_text) < 100:
+        raise HTTPException(status_code=400, detail="Could not extract sufficient text from PDF")
+    
+    resume_embedding = await create_embedding_api(resume_text)
     
     async with aiosqlite.connect(DATABASE_FILE) as db:
         await db.execute("""
-            INSERT INTO job_descriptions (title, description, department, location, embedding, embedding_created)
-            VALUES (?, ?, ?, ?, ?, 1)
-        """, (job.title, job.description, job.department, job.location, embedding))
+            INSERT INTO resumes (user_id, full_name, email, resume_text, embedding, status)
+            VALUES (?, ?, ?, ?, ?, 'pending')
+        """, (user["id"], full_name, email, resume_text, resume_embedding))
+        await db.commit()
+        
+        cursor = await db.execute("SELECT last_insert_rowid()")
+        resume_id = (await cursor.fetchone())[0]
+    
+    # Process matching in background
+    background_tasks.add_task(process_resume_matching, resume_id, user["id"])
+    
+    return {
+        "id": resume_id,
+        "full_name": full_name,
+        "email": email,
+        "status": "processing",
+        "message": "Resume uploaded successfully. Matching in progress!"
+    }
+
+# ============== EMPLOYER ROUTES ==============
+
+@app.get("/employer/dashboard", response_class=HTMLResponse)
+async def employer_dashboard(request: Request, user: Dict = Depends(get_employer)):
+    """Employer dashboard"""
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        
+        # Stats
+        cursor = await db.execute(
+            "SELECT COUNT(*) as count FROM job_descriptions WHERE employer_id = ? AND is_active = 1", 
+            (user["id"],)
+        )
+        total_jobs = (await cursor.fetchone())["count"]
+        
+        cursor = await db.execute("""
+            SELECT COUNT(*) as count FROM matches WHERE employer_id = ?
+        """, (user["id"],))
+        total_applications = (await cursor.fetchone())["count"]
+        
+        cursor = await db.execute("""
+            SELECT COUNT(*) as count FROM matches WHERE employer_id = ? AND status = 'matched'
+        """, (user["id"],))
+        matched_candidates = (await cursor.fetchone())["count"]
+        
+        cursor = await db.execute("""
+            SELECT COUNT(*) as count FROM matches WHERE employer_id = ? AND status = 'reviewing'
+        """, (user["id"],))
+        pending_reviews = (await cursor.fetchone())["count"]
+        
+        # Jobs with match counts
+        cursor = await db.execute("""
+            SELECT j.*, COUNT(m.id) as match_count
+            FROM job_descriptions j
+            LEFT JOIN matches m ON j.id = m.job_id
+            WHERE j.employer_id = ? AND j.is_active = 1
+            GROUP BY j.id
+            ORDER BY j.created_at DESC
+        """, (user["id"],))
+        jobs = await cursor.fetchall()
+        
+        # Recent matches
+        cursor = await db.execute("""
+            SELECT m.*, r.full_name, r.email, j.title as job_title
+            FROM matches m
+            JOIN resumes r ON m.resume_id = r.id
+            JOIN job_descriptions j ON m.job_id = j.id
+            WHERE m.employer_id = ?
+            ORDER BY m.created_at DESC
+            LIMIT 10
+        """, (user["id"],))
+        recent_matches = await cursor.fetchall()
+    
+    return templates.TemplateResponse("employer_dashboard.html", {
+        "request": request,
+        "user": user,
+        "stats": {
+            "total_jobs": total_jobs,
+            "total_applications": total_applications,
+            "matched_candidates": matched_candidates,
+            "pending_reviews": pending_reviews
+        },
+        "jobs": jobs,
+        "recent_matches": recent_matches
+    })
+
+@app.post("/employer/jobs")
+async def employer_create_job(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    title: str = Form(...),
+    description: str = Form(...),
+    department: Optional[str] = Form(None),
+    location: Optional[str] = Form(None),
+    requirements: Optional[str] = Form(None),
+    salary_range: Optional[str] = Form(None),
+    user: Dict = Depends(get_employer)
+):
+    """Employer creates a job posting"""
+    embedding = await create_embedding_api(description)
+    
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        await db.execute("""
+            INSERT INTO job_descriptions 
+            (employer_id, title, description, department, location, requirements, salary_range, embedding, embedding_created)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+        """, (user["id"], title, description, department, location, requirements, salary_range, embedding))
         await db.commit()
         
         cursor = await db.execute("SELECT last_insert_rowid()")
         job_id = (await cursor.fetchone())[0]
     
     # Reprocess pending resumes in background
-    background_tasks.add_task(reprocess_pending_resumes, job_id, background_tasks)
+    background_tasks.add_task(reprocess_pending_resumes, job_id, user["id"])
     
-    return {
-        "id": job_id,
-        "title": job.title,
-        "description": job.description,
-        "department": job.department,
-        "location": job.location,
-        "embedding_created": True,
-        "created_at": datetime.now().isoformat()
-    }
+    return {"id": job_id, "message": "Job posted successfully! Matching candidates..."}
 
-@app.get("/admin/jobs", response_model=List[JobDescriptionResponse])
-async def list_jobs(admin: str = Depends(get_current_admin)):
-    """List all job descriptions"""
-    
+@app.delete("/employer/jobs/{job_id}")
+async def employer_delete_job(job_id: int, user: Dict = Depends(get_employer)):
+    """Delete employer's job"""
     async with aiosqlite.connect(DATABASE_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute("""
-            SELECT id, title, description, department, location, embedding_created, created_at 
-            FROM job_descriptions 
-            ORDER BY created_at DESC
-        """)
-        jobs = await cursor.fetchall()
-    
-    return [
-        {
-            "id": job["id"],
-            "title": job["title"],
-            "description": job["description"],
-            "department": job["department"],
-            "location": job["location"],
-            "embedding_created": bool(job["embedding_created"]),
-            "created_at": job["created_at"]
-        }
-        for job in jobs
-    ]
-
-@app.delete("/admin/jobs/{job_id}")
-async def delete_job(job_id: int, admin: str = Depends(get_current_admin)):
-    """Delete a job description"""
-    
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        cursor = await db.execute("DELETE FROM job_descriptions WHERE id = ?", (job_id,))
+        cursor = await db.execute(
+            "DELETE FROM job_descriptions WHERE id = ? AND employer_id = ?", 
+            (job_id, user["id"])
+        )
         await db.commit()
         
         if cursor.rowcount == 0:
@@ -1529,89 +2766,297 @@ async def delete_job(job_id: int, admin: str = Depends(get_current_admin)):
     
     return {"message": "Job deleted successfully"}
 
-@app.get("/admin/resumes")
-async def list_resumes(admin: str = Depends(get_current_admin)):
-    """List all resumes"""
-    
+@app.get("/employer/jobs/{job_id}/candidates", response_class=HTMLResponse)
+async def employer_job_candidates(request: Request, job_id: int, user: Dict = Depends(get_employer)):
+    """View candidates for a specific job"""
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("""
-            SELECT r.*, j.title as job_title 
-            FROM resumes r
-            LEFT JOIN job_descriptions j ON r.matched_job_id = j.id
-            ORDER BY r.created_at DESC
-        """)
-        resumes = await cursor.fetchall()
-    
-    return [
-        {
-            "id": resume["id"],
-            "full_name": resume["full_name"],
-            "email": resume["email"],
-            "status": resume["status"],
-            "match_score": resume["match_score"],
-            "matched_job": resume["job_title"],
-            "created_at": resume["created_at"]
-        }
-        for resume in resumes
-    ]
-
-@app.post("/upload-resume", response_model=ResumeUploadResponse)
-async def upload_resume(
-    background_tasks: BackgroundTasks,
-    full_name: str = Form(...),
-    email: EmailStr = Form(...),
-    resume_file: UploadFile = File(...)
-):
-    """Upload resume - uses HF API with specialized ATS model"""
-    
-    # Validate file type
-    if not resume_file.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
-    
-    # Read and extract text from PDF
-    contents = await resume_file.read()
-    resume_text = extract_text_from_pdf(contents)
-    
-    if not resume_text or len(resume_text) < 100:
-        raise HTTPException(status_code=400, detail="Could not extract sufficient text from PDF")
-    
-    # Create embedding via API (specialized ATS model)
-    resume_embedding = await create_embedding_api(resume_text)
-    
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        await db.execute("""
-            INSERT INTO resumes (full_name, email, resume_text, embedding, status)
-            VALUES (?, ?, ?, ?, 'pending')
-        """, (full_name, email, resume_text, resume_embedding))
-        await db.commit()
         
-        cursor = await db.execute("SELECT last_insert_rowid()")
-        resume_id = (await cursor.fetchone())[0]
+        # Verify job belongs to employer
+        cursor = await db.execute(
+            "SELECT * FROM job_descriptions WHERE id = ? AND employer_id = ?", 
+            (job_id, user["id"])
+        )
+        job = await cursor.fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        # Get candidates
+        cursor = await db.execute("""
+            SELECT m.*, r.full_name, r.email, r.resume_text
+            FROM matches m
+            JOIN resumes r ON m.resume_id = r.id
+            WHERE m.job_id = ?
+            ORDER BY m.match_score DESC
+        """, (job_id,))
+        candidates = await cursor.fetchall()
     
-    # Process matching in background
-    background_tasks.add_task(process_resume_matching, resume_id, background_tasks)
+    # Simple HTML for candidate list
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Candidates - {job['title']}</title>
+        <style>
+            body {{ font-family: 'Segoe UI', sans-serif; background: #f5f7fa; margin: 0; }}
+            .navbar {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px 40px; }}
+            .container {{ max-width: 1200px; margin: 0 auto; padding: 40px; }}
+            .job-header {{ background: white; padding: 30px; border-radius: 15px; margin-bottom: 30px; }}
+            .candidate-card {{ background: white; padding: 25px; border-radius: 15px; margin-bottom: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); }}
+            .score {{ font-size: 2em; color: #667eea; font-weight: bold; }}
+            .btn {{ padding: 10px 25px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 20px; cursor: pointer; text-decoration: none; display: inline-block; }}
+            .btn-success {{ background: #28a745; }}
+        </style>
+    </head>
+    <body>
+        <div class="navbar">
+            <h1>🎯 Candidates for {job['title']}</h1>
+        </div>
+        <div class="container">
+            <div class="job-header">
+                <h2>{job['title']}</h2>
+                <p>{job['department'] or ''} | {job['location'] or ''}</p>
+                <a href="/employer/dashboard" class="btn">← Back to Dashboard</a>
+            </div>
+    """
+    
+    for candidate in candidates:
+        html += f"""
+            <div class="candidate-card">
+                <h3>{candidate['full_name']}</h3>
+                <p>📧 {candidate['email']}</p>
+                <div class="score">{candidate['match_score']*100:.1f}%</div>
+                <p>Status: <strong>{candidate['status']}</strong></p>
+                <div style="margin-top: 15px;">
+                    <a href="/employer/candidates/{candidate['resume_id']}/cv" class="btn" target="_blank">View CV</a>
+                    <a href="mailto:{candidate['email']}" class="btn btn-success">Email</a>
+                </div>
+            </div>
+        """
+    
+    if not candidates:
+        html += '<p style="text-align: center; color: #666; padding: 40px;">No candidates yet.</p>'
+    
+    html += """
+        </div>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html)
+
+@app.get("/employer/candidates/{resume_id}/cv")
+async def employer_view_cv(resume_id: int, user: Dict = Depends(get_employer)):
+    """View candidate CV text"""
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        
+        # Verify employer has a match with this resume
+        cursor = await db.execute("""
+            SELECT r.* FROM resumes r
+            JOIN matches m ON r.id = m.resume_id
+            WHERE r.id = ? AND m.employer_id = ?
+        """, (resume_id, user["id"]))
+        resume = await cursor.fetchone()
+        
+        if not resume:
+            raise HTTPException(status_code=404, detail="CV not found")
     
     return {
-        "id": resume_id,
-        "full_name": full_name,
-        "email": email,
-        "status": "processing",
-        "message": "Resume uploaded successfully. You will receive an email notification shortly."
+        "candidate_name": resume["full_name"],
+        "email": resume["email"],
+        "resume_text": resume["resume_text"],
+        "uploaded_at": resume["created_at"]
     }
+
+@app.post("/employer/candidates/{resume_id}/status")
+async def employer_update_status(
+    resume_id: int,
+    status: str = Form(...),
+    job_id: int = Form(...),
+    user: Dict = Depends(get_employer)
+):
+    """Update candidate status"""
+    if status not in ["matched", "reviewing", "interview", "hired", "rejected"]:
+        raise HTTPException(status_code=400, detail="Invalid status")
+    
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cursor = await db.execute("""
+            UPDATE matches SET status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE resume_id = ? AND job_id = ? AND employer_id = ?
+        """, (status, resume_id, job_id, user["id"]))
+        await db.commit()
+        
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Match not found")
+        
+        # Get candidate email for notification
+        cursor = await db.execute("""
+            SELECT r.email, r.full_name, j.title 
+            FROM resumes r
+            JOIN matches m ON r.id = m.resume_id
+            JOIN job_descriptions j ON m.job_id = j.id
+            WHERE r.id = ? AND m.job_id = ?
+        """, (resume_id, job_id))
+        result = await cursor.fetchone()
+        
+        if result:
+            subject = f"Application Update: {result['title']}"
+            body = f"""
+Dear {result['full_name']},
+
+Your application status for "{result['title']}" has been updated to: {status.upper()}
+
+Best regards,
+Hiring Team
+"""
+            await send_email(result["email"], subject, body)
+    
+    return {"message": "Status updated successfully"}
+
+@app.get("/employer/notifications")
+async def employer_notifications(user: Dict = Depends(get_employer)):
+    """Get unread notifications for employer"""
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        
+        cursor = await db.execute("""
+            SELECT COUNT(*) as count FROM notifications 
+            WHERE user_id = ? AND is_read = 0
+        """, (user["id"],))
+        count = (await cursor.fetchone())["count"]
+        
+        # Mark as read
+        await db.execute("""
+            UPDATE notifications SET is_read = 1 WHERE user_id = ?
+        """, (user["id"],))
+        await db.commit()
+    
+    return {"new_matches": count}
+
+# ============== RECRUITER ROUTES ==============
+
+@app.get("/recruiter/dashboard", response_class=HTMLResponse)
+async def recruiter_dashboard(request: Request, user: Dict = Depends(get_recruiter)):
+    """Recruiter admin dashboard"""
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        
+        # Stats
+        cursor = await db.execute("SELECT COUNT(*) as count FROM users WHERE role = 'employer' AND is_active = 1")
+        total_employers = (await cursor.fetchone())["count"]
+        
+        cursor = await db.execute("SELECT COUNT(*) as count FROM users WHERE role = 'graduate' AND is_active = 1")
+        total_graduates = (await cursor.fetchone())["count"]
+        
+        cursor = await db.execute("SELECT COUNT(*) as count FROM job_descriptions WHERE is_active = 1")
+        total_jobs = (await cursor.fetchone())["count"]
+        
+        cursor = await db.execute("SELECT COUNT(*) as count FROM matches")
+        total_matches = (await cursor.fetchone())["count"]
+        
+        cursor = await db.execute("""
+            SELECT COUNT(*) as count FROM matches WHERE status = 'reviewing'
+        """)
+        pending_reviews = (await cursor.fetchone())["count"]
+        
+        # Employers with job counts
+        cursor = await db.execute("""
+            SELECT u.*, COUNT(j.id) as job_count
+            FROM users u
+            LEFT JOIN job_descriptions j ON u.id = j.employer_id AND j.is_active = 1
+            WHERE u.role = 'employer' AND u.is_active = 1
+            GROUP BY u.id
+            ORDER BY u.created_at DESC
+        """)
+        employers = await cursor.fetchall()
+        
+        # Graduates with resume/match counts
+        cursor = await db.execute("""
+            SELECT u.*, 
+                   COUNT(DISTINCT r.id) as resume_count,
+                   COUNT(DISTINCT m.id) as match_count
+            FROM users u
+            LEFT JOIN resumes r ON u.id = r.user_id
+            LEFT JOIN matches m ON r.id = m.resume_id
+            WHERE u.role = 'graduate' AND u.is_active = 1
+            GROUP BY u.id
+            ORDER BY u.created_at DESC
+        """)
+        graduates = await cursor.fetchall()
+        
+        # All jobs
+        cursor = await db.execute("""
+            SELECT j.*, u.full_name as employer_name,
+                   COUNT(m.id) as match_count
+            FROM job_descriptions j
+            JOIN users u ON j.employer_id = u.id
+            LEFT JOIN matches m ON j.id = m.job_id
+            WHERE j.is_active = 1
+            GROUP BY j.id
+            ORDER BY j.created_at DESC
+        """)
+        all_jobs = await cursor.fetchall()
+        
+        # All matches
+        cursor = await db.execute("""
+            SELECT m.*, r.full_name as candidate_name, j.title as job_title,
+                   u.full_name as employer_name, m.created_at as matched_at
+            FROM matches m
+            JOIN resumes r ON m.resume_id = r.id
+            JOIN job_descriptions j ON m.job_id = j.id
+            JOIN users u ON j.employer_id = u.id
+            ORDER BY m.created_at DESC
+            LIMIT 100
+        """)
+        all_matches = await cursor.fetchall()
+    
+    return templates.TemplateResponse("recruiter_dashboard.html", {
+        "request": request,
+        "user": user,
+        "stats": {
+            "total_employers": total_employers,
+            "total_graduates": total_graduates,
+            "total_jobs": total_jobs,
+            "total_matches": total_matches,
+            "pending_reviews": pending_reviews
+        },
+        "employers": employers,
+        "graduates": graduates,
+        "all_jobs": all_jobs,
+        "all_matches": all_matches
+    })
+
+@app.delete("/recruiter/users/{user_id}")
+async def recruiter_delete_user(user_id: int, role: str, user: Dict = Depends(get_recruiter)):
+    """Recruiter can delete employer or graduate accounts"""
+    if role not in ["employer", "graduate"]:
+        raise HTTPException(status_code=400, detail="Can only delete employer or graduate accounts")
+    
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        # Soft delete
+        await db.execute("""
+            UPDATE users SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND role = ?
+        """, (user_id, role))
+        await db.commit()
+    
+    return {"message": f"{role} account deactivated"}
+
+# ============== HEALTH CHECK ==============
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
+        "version": "3.0.0",
+        "roles": ["recruiter", "employer", "graduate"],
         "embedding_source": "HuggingFace Inference API",
-        "model": "0xnbk/nbk-ats-semantic-v1-en (specialized ATS model)",
-        "fallback": "all-MiniLM-L6-v2 or hash-based",
-        "database": "connected",
-        "memory_usage": "minimal (no local ML model)"
+        "database": "connected"
     }
 
-# Run the application
+# ============== RUN ==============
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
