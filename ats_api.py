@@ -50,8 +50,10 @@ import shutil
 DATABASE_FILE = "glink_database.db"
 MATCH_THRESHOLD = 0.80  # 80% match threshold
 
+
+
 # HuggingFace API for embeddings
-HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/0xnbk/nbk-ats-semantic-v1-en"
+HF_API_URL = "https://api-inference.huggingface.co/models/0xnbk/nbk-ats-semantic-v1-en"
 HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
