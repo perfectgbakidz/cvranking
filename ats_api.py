@@ -1,5 +1,5 @@
 """
-FastAPI ATS Semantic Matching System with Multi-Role Authentication
+FastAPI Glink Semantic Matching System with Multi-Role Authentication
 Roles: Recruiter (Admin), Employer, Graduate (Applicant)
 """
 
@@ -47,7 +47,7 @@ import tempfile
 import shutil
 
 # Configuration
-DATABASE_FILE = "ats_database.db"
+DATABASE_FILE = "glink_database.db"
 MATCH_THRESHOLD = 0.80  # 80% match threshold
 
 # HuggingFace API for embeddings
@@ -58,7 +58,7 @@ SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
-FROM_EMAIL = os.getenv("FROM_EMAIL", "noreply@ats-system.com")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "noreply@glink-system.com")
 
 # Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -150,7 +150,7 @@ INDEX_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ATS Semantic Matching System</title>
+    <title>Glink Semantic Matching System</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { 
@@ -254,7 +254,7 @@ INDEX_TEMPLATE = """
 <body>
     <div class="container">
         <div class="header">
-            <h1>🎯 Smart ATS</h1>
+            <h1>🎯 Smart Glink</h1>
             <p>AI-Powered Resume & Job Matching System</p>
         </div>
         
@@ -296,7 +296,7 @@ INDEX_TEMPLATE = """
                 </div>
                 <div class="feature-item">
                     <h3>🤖 AI Analysis</h3>
-                    <p>Specialized ATS model matching</p>
+                    <p>Specialized model matching</p>
                 </div>
                 <div class="feature-item">
                     <h3>🎯 Matching</h3>
@@ -327,7 +327,7 @@ SIGNUP_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sign Up - ATS System</title>
+    <title>Sign Up - Glink System</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -469,7 +469,7 @@ LOGIN_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login - ATS System</title>
+    <title>Login - Glink System</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -582,7 +582,7 @@ EMPLOYER_DASHBOARD_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Employer Dashboard - ATS System</title>
+    <title>Employer Dashboard - Glink System</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -914,16 +914,15 @@ EMPLOYER_DASHBOARD_TEMPLATE = """
             document.getElementById('jobModal').classList.remove('active');
         }
         
+        // FIXED: Use FormData directly instead of JSON.stringify
         async function submitJob(e) {
             e.preventDefault();
             const formData = new FormData(e.target);
-            const data = Object.fromEntries(formData);
             
             try {
                 const response = await fetch('/employer/jobs', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(data)
+                    body: formData
                 });
                 
                 if (response.ok) {
@@ -955,9 +954,9 @@ EMPLOYER_DASHBOARD_TEMPLATE = """
         async function updateStatus(resumeId, status) {
             try {
                 const response = await fetch(`/employer/candidates/${resumeId}/status`, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ status: status })
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({ status: status, job_id: '1' })
                 });
                 if (response.ok) {
                     alert('Status updated!');
@@ -996,7 +995,7 @@ GRADUATE_DASHBOARD_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>My Dashboard - ATS System</title>
+    <title>My Dashboard - Glink System</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -1209,7 +1208,7 @@ RECRUITER_DASHBOARD_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Recruiter Dashboard - ATS System</title>
+    <title>Recruiter Dashboard - Glink System</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -1532,7 +1531,7 @@ RESUME_UPLOAD_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Upload Resume - ATS System</title>
+    <title>Upload Resume - Glink System</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -1764,7 +1763,7 @@ CANDIDATE_DETAIL_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Candidate Details - ATS System</title>
+    <title>Candidate Details - Glink System</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -2031,9 +2030,9 @@ async def init_database():
             await db.execute("""
                 INSERT INTO users (email, password_hash, full_name, role, company_name)
                 VALUES (?, ?, ?, ?, ?)
-            """, ("recruiter@ats.com", hashed, "System Recruiter", "recruiter", "ATS Platform"))
+            """, ("recruiter@glink.com", hashed, "System Recruiter", "recruiter", "Glink Platform"))
             await db.commit()
-            print("Created default recruiter: recruiter@ats.com / recruiter123")
+            print("Created default recruiter: recruiter@glink.com / recruiter123")
 
 # ============== AUTH HELPERS ==============
 
@@ -2294,7 +2293,7 @@ Match Score: {match['score']*100:.1f}%
 View the candidate in your dashboard: /employer/dashboard
 
 Best regards,
-ATS Recruitment Team
+Glink Recruitment Team
 """
                 await send_email(employer["email"], subject, body)
         
@@ -2318,7 +2317,7 @@ Thank you for submitting your resume. While we don't currently have an opening t
 You will receive an automatic notification as soon as a matching position becomes available.
 
 Best regards,
-ATS Recruitment Team
+Glink Recruitment Team
 """
             await send_email(resume["email"], subject, body)
         
@@ -2385,7 +2384,7 @@ Your new job posting has received {new_matches} candidate match(es)!
 View them in your employer dashboard.
 
 Best regards,
-ATS Recruitment Team
+Glink Recruitment Team
 """
                 await send_email(employer["email"], subject, body)
 
@@ -2397,14 +2396,14 @@ async def lifespan(app: FastAPI):
     setup_templates()
     print("Initializing database...")
     await init_database()
-    print("Multi-role ATS system initialized")
+    print("Multi-role Glink system initialized")
     yield
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
     print("Shutting down...")
 
 app = FastAPI(
-    title="ATS Semantic Matching API - Multi-Role",
-    description="AI-powered ATS with Recruiter, Employer, and Graduate roles",
+    title="Glink Semantic Matching API - Multi-Role",
+    description="AI-powered Glink with Recruiter, Employer, and Graduate roles",
     version="3.0.0",
     lifespan=lifespan
 )
