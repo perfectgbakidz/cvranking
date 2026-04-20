@@ -2169,7 +2169,7 @@ async def create_embedding_api(text: str) -> bytes:
                     raise Exception(f"API error: {response.status}")
     except Exception as e:
         print(f"Primary API failed ({e}), trying fallback...")
-        fallback_url = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+        fallback_url = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
         try:
             timeout = aiohttp.ClientTimeout(total=30)
             async with aiohttp.ClientSession(timeout=timeout) as session:
